@@ -16,7 +16,7 @@ TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 # 🔎 PARSER SYGNAŁU (TradingView / text)
 # ==================================================
 def parse_signal(text: str):
-    if not text:
+    if not text or text == "EMPTY":
         return None
 
     text_lower = text.lower()
@@ -36,8 +36,8 @@ def parse_signal(text: str):
     size_match = re.search(r"@\s*([0-9.]+)", text_lower)
     size = float(size_match.group(1)) if size_match else None
 
-    # timeframe (M1, M5, M15, itp.)
-    tf_match = re.search(r"\((m\d+)", text_lower)
+    # timeframe (M1, M5, M15...)
+    tf_match = re.search(r"\((m\d+)\)", text_lower)
     timeframe = tf_match.group(1).upper() if tf_match else None
 
     # confidence
@@ -55,11 +55,11 @@ def parse_signal(text: str):
 
 
 # ==================================================
-# 📈 TWELVE DATA – LIVE PRICE
+# 📈 TWELVE DATA – LIVE PRICE (BEZPIECZNE)
 # ==================================================
 def get_live_price(symbol: str):
     if not TWELVE_API_KEY:
-        return None
+        raise Exception("TWELVE_API_KEY not set")
 
     url = "https://api.twelvedata.com/price"
     params = {
@@ -67,11 +67,15 @@ def get_live_price(symbol: str):
         "apikey": TWELVE_API_KEY
     }
 
-    r = requests.get(url, params=params, timeout=10)
+    r = requests.get(url, params=params, timeout=5)
+
+    if r.status_code != 200:
+        raise Exception(f"HTTP {r.status_code}")
+
     data = r.json()
 
     if "price" not in data:
-        raise Exception(f"TwelveData error: {data}")
+        raise Exception(data)
 
     return float(data["price"])
 
@@ -91,22 +95,27 @@ async def webhook(request: Request):
     raw_body = await request.body()
     text = raw_body.decode("utf-8") if raw_body else "EMPTY"
 
-    # 3️⃣ Log surowy (Railway → Logs)
+    # 3️⃣ Log surowy
     print("📩 Webhook received")
     print("Raw body:", text)
 
-    # 4️⃣ Parsowanie sygnału
+    # 4️⃣ Parsowanie
     parsed = parse_signal(text)
     print("🧠 Parsed signal:", parsed)
 
-    # 5️⃣ Cena rynkowa (jeśli symbol znany)
+    # 5️⃣ Cena rynkowa (NIGDY NIE MOŻE WYWRÓCIĆ WEBHOOKA)
     price = None
-    if parsed and parsed["symbol"] != "UNKNOWN":
-        try:
-            price = get_live_price(parsed["symbol"])
-        except Exception as e:
-            print("❌ TwelveData error:", e)
 
+    if parsed and parsed.get("symbol") and parsed["symbol"] != "UNKNOWN":
+        if TWELVE_API_KEY:
+            try:
+                price = get_live_price(parsed["symbol"])
+            except Exception as e:
+                print("❌ TwelveData error:", str(e))
+        else:
+            print("⚠️ TWELVE_API_KEY not set – skipping price fetch")
+
+    # 6️⃣ ZAWSZE ZWRACAMY ODP.
     return {
         "status": "ok",
         "parsed": parsed,
