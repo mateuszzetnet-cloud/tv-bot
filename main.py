@@ -1,25 +1,32 @@
-from fastapi import FastAPI, Request
+import os
+from fastapi import FastAPI, Request, HTTPException
 
 app = FastAPI()
 
+# Sekret pobierany z Railway Variables
+SECRET = os.getenv("WEBHOOK_TOKEN")
+
 @app.post("/webhook")
 async def webhook(request: Request):
-    try:
-        body = await request.body()
-        body_text = body.decode("utf-8") if body else "EMPTY"
+    token = request.query_params.get("token")
 
-        print("📩 Webhook received")
-        print("Raw body:", body_text)
+    # 1️⃣ Zabezpieczenie
+    if token != SECRET:
+        raise HTTPException(status_code=403, detail="Invalid token")
 
-        # domyślna akcja (np. BUY)
-        action = "buy"
+    # 2️⃣ Odczyt body (działa też gdy EMPTY)
+    raw_body = await request.body()
+    text = raw_body.decode("utf-8") if raw_body else "EMPTY"
 
-        return {
-            "status": "ok",
-            "received": body_text,
-            "action": action
-        }
+    # 3️⃣ Log (widzisz w Railway)
+    print("Webhook received:")
+    print(text)
 
-    except Exception as e:
-        print("❌ ERROR:", e)
-        return {"status": "error"}
+    # 4️⃣ Tymczasowa logika (placeholder)
+    action = "buy" if "buy" in text.lower() else "sell" if "sell" in text.lower() else "none"
+
+    return {
+        "status": "ok",
+        "received": text,
+        "action": action
+    }
