@@ -1,51 +1,25 @@
 from fastapi import FastAPI, Request
-from datetime import datetime
-import pandas as pd
-import os
 
 app = FastAPI()
 
-DATA_DIR = "data"
-DATA_FILE = f"{DATA_DIR}/signals.csv"
-
-os.makedirs(DATA_DIR, exist_ok=True)
-
-# inicjalizacja pliku
-if not os.path.exists(DATA_FILE):
-    df = pd.DataFrame(columns=[
-        "timestamp",
-        "symbol",
-        "timeframe",
-        "strategy",
-        "direction",
-        "price",
-        "raw_payload"
-    ])
-    df.to_csv(DATA_FILE, index=False)
-
-
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "tradingview-webhook"}
-
-
 @app.post("/webhook")
 async def webhook(request: Request):
-    data = await request.json()
+    try:
+        body = await request.body()
+        body_text = body.decode("utf-8") if body else "EMPTY"
 
-    row = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "symbol": data.get("symbol"),
-        "timeframe": data.get("timeframe"),
-        "strategy": data.get("strategy"),
-        "direction": data.get("direction"),
-        "price": data.get("price"),
-        "raw_payload": str(data)
-    }
+        print("📩 Webhook received")
+        print("Raw body:", body_text)
 
-    df = pd.DataFrame([row])
-    df.to_csv(DATA_FILE, mode="a", header=False, index=False)
+        # domyślna akcja (np. BUY)
+        action = "buy"
 
-    print("WEBHOOK SAVED:", row)
+        return {
+            "status": "ok",
+            "received": body_text,
+            "action": action
+        }
 
-    return {"received": True}
+    except Exception as e:
+        print("❌ ERROR:", e)
+        return {"status": "error"}
