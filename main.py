@@ -12,7 +12,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
 # ==================================================
-# 🔁 MAPOWANIE SYMBOLI
+# 🔁 MAPOWANIE SYMBOLI (TradingView → TwelveData)
 # ==================================================
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
@@ -82,50 +82,37 @@ def get_live_price(symbol: str):
     return float(data["price"])
 
 # ==================================================
-# 🧠 EVALUATE TRADE (RULE-BASED CORE)
+# 🧠 ETAP 1 – ENGINE DECYZYJNY
 # ==================================================
-def evaluate_trade(parsed: dict, live_price: float):
+def evaluate_trade(parsed: dict):
     """
-    Zwraca decyzję na podstawie reguł
-    """
-
-    decision = "NO_TRADE"
-    reasons = []
-    score = 0
-
-    # 1️⃣ Confidence
-    if parsed["confidence"] == "HIGH":
-        score += 1
-    else:
-        reasons.append("Low confidence")
-
-    # 2️⃣ Placeholder SMA200 (docelowo z historycznych danych)
-    sma200_trend = "above"  # symulacja
-    if parsed["action"] == "buy" and sma200_trend == "above":
-        score += 1
-    elif parsed["action"] == "sell" and sma200_trend == "below":
-        score += 1
-    else:
-        reasons.append("Against SMA200")
-
-    # 3️⃣ Placeholder stochastic
-    stochastic_signal = "bullish"  # symulacja
-    if parsed["action"] == "buy" and stochastic_signal == "bullish":
-        score += 1
-    elif parsed["action"] == "sell" and stochastic_signal == "bearish":
-        score += 1
-    else:
-        reasons.append("Stochastic not aligned")
-
-    # ✅ Decyzja końcowa
-    if score >= 3:
-        decision = "BUY" if parsed["action"] == "buy" else "SELL"
-
-    return {
-        "decision": decision,
-        "score": score,
-        "reasons": reasons
+    Zwraca:
+    {
+        decision: BUY / SELL / REJECT
+        reason: tekst
     }
+    """
+
+    if not parsed:
+        return {"decision": "REJECT", "reason": "Empty signal"}
+
+    if parsed["symbol"] == "UNKNOWN":
+        return {"decision": "REJECT", "reason": "Unknown symbol"}
+
+    if parsed["action"] not in ("buy", "sell"):
+        return {"decision": "REJECT", "reason": "No action"}
+
+    if parsed["confidence"] != "HIGH":
+        return {"decision": "REJECT", "reason": "Low confidence"}
+
+    # ETAP 1 → jeśli przeszedł sanity + confidence
+    if parsed["action"] == "buy":
+        return {"decision": "BUY", "reason": "Basic rules passed"}
+
+    if parsed["action"] == "sell":
+        return {"decision": "SELL", "reason": "Basic rules passed"}
+
+    return {"decision": "REJECT", "reason": "Fallback reject"}
 
 # ==================================================
 # 🌐 WEBHOOK
@@ -146,23 +133,20 @@ async def webhook(request: Request):
     parsed = parse_signal(text)
     print("🧠 Parsed signal:", parsed)
 
-    live_price = None
-    evaluation = None
+    decision = evaluate_trade(parsed)
+    print("⚙️ Decision:", decision)
 
+    price = None
     if parsed and parsed["symbol"] != "UNKNOWN":
         try:
-            live_price = get_live_price(parsed["symbol"])
-            print("✅ Live price:", live_price)
-
-            evaluation = evaluate_trade(parsed, live_price)
-            print("🧪 Evaluation:", evaluation)
-
+            price = get_live_price(parsed["symbol"])
+            print("✅ Live price:", price)
         except Exception as e:
-            print("❌ Error:", e)
+            print("❌ TwelveData error:", e)
 
     return {
         "status": "ok",
         "parsed": parsed,
-        "live_price": live_price,
-        "evaluation": evaluation
+        "decision": decision,
+        "live_price": price
     }
