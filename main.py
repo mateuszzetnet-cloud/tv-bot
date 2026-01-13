@@ -11,6 +11,15 @@ app = FastAPI()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
+# ==================================================
+# 🔁 MAPOWANIE SYMBOLI (TradingView → TwelveData)
+# ==================================================
+SYMBOL_MAP = {
+    "XAUUSD": "XAU/USD",
+    "BTCUSDT": "BTC/USD",
+    "ETHUSDT": "ETH/USD",
+    "EURUSD": "EUR/USD",
+}
 
 # ==================================================
 # 🔎 PARSER SYGNAŁU (TradingView / text)
@@ -53,17 +62,19 @@ def parse_signal(text: str):
         "raw": text
     }
 
-
 # ==================================================
-# 📈 TWELVE DATA – LIVE PRICE (BEZPIECZNE)
+# 📈 TWELVE DATA – LIVE PRICE (Z MAPOWANIEM)
 # ==================================================
 def get_live_price(symbol: str):
     if not TWELVE_API_KEY:
         raise Exception("TWELVE_API_KEY not set")
 
+    mapped_symbol = SYMBOL_MAP.get(symbol, symbol)
+    print(f"📈 TwelveData symbol: {mapped_symbol}")
+
     url = "https://api.twelvedata.com/price"
     params = {
-        "symbol": symbol,
+        "symbol": mapped_symbol,
         "apikey": TWELVE_API_KEY
     }
 
@@ -78,7 +89,6 @@ def get_live_price(symbol: str):
         raise Exception(data)
 
     return float(data["price"])
-
 
 # ==================================================
 # 🌐 WEBHOOK
@@ -110,8 +120,9 @@ async def webhook(request: Request):
         if TWELVE_API_KEY:
             try:
                 price = get_live_price(parsed["symbol"])
+                print("✅ Live price:", price)
             except Exception as e:
-                print("❌ TwelveData error:", str(e))
+                print("❌ TwelveData error:", e)
         else:
             print("⚠️ TWELVE_API_KEY not set – skipping price fetch")
 
