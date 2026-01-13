@@ -6,13 +6,13 @@ from fastapi import FastAPI, Request, HTTPException
 app = FastAPI()
 
 # ==================================================
-# 🔐 ZMIENNE ŚRODOWISKOWE (Railway → Variables)
+# 🔐 ZMIENNE ŚRODOWISKOWE
 # ==================================================
 WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
 # ==================================================
-# 🔁 MAPOWANIE SYMBOLI (TradingView → TwelveData)
+# 🔁 MAPOWANIE SYMBOLI
 # ==================================================
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
@@ -22,7 +22,7 @@ SYMBOL_MAP = {
 }
 
 # ==================================================
-# 🔎 PARSER SYGNAŁU (TradingView / text)
+# 🔎 PARSER SYGNAŁU
 # ==================================================
 def parse_signal(text: str):
     if not text or text == "EMPTY":
@@ -30,26 +30,21 @@ def parse_signal(text: str):
 
     text_lower = text.lower()
 
-    # akcja
     action = None
     if "buy" in text_lower:
         action = "buy"
     elif "sell" in text_lower:
         action = "sell"
 
-    # symbol
     symbol_match = re.search(r"(xauusd|eurusd|btcusdt|ethusdt)", text_lower)
     symbol = symbol_match.group(1).upper() if symbol_match else "UNKNOWN"
 
-    # size (np. @ 0.2 albo @0.4)
     size_match = re.search(r"@\s*([0-9.]+)", text_lower)
     size = float(size_match.group(1)) if size_match else None
 
-    # timeframe (M1, M5, M15...)
     tf_match = re.search(r"\((m\d+)\)", text_lower)
     timeframe = tf_match.group(1).upper() if tf_match else None
 
-    # confidence
     confidence = "HIGH" if "high" in text_lower else "NORMAL"
 
     return {
@@ -63,7 +58,7 @@ def parse_signal(text: str):
     }
 
 # ==================================================
-# 📈 TWELVE DATA – LIVE PRICE (Z MAPOWANIEM)
+# 📈 TWELVE DATA – LIVE PRICE
 # ==================================================
 def get_live_price(symbol: str):
     if not TWELVE_API_KEY:
@@ -79,10 +74,6 @@ def get_live_price(symbol: str):
     }
 
     r = requests.get(url, params=params, timeout=5)
-
-    if r.status_code != 200:
-        raise Exception(f"HTTP {r.status_code}")
-
     data = r.json()
 
     if "price" not in data:
@@ -91,44 +82,87 @@ def get_live_price(symbol: str):
     return float(data["price"])
 
 # ==================================================
+# 🧠 EVALUATE TRADE (RULE-BASED CORE)
+# ==================================================
+def evaluate_trade(parsed: dict, live_price: float):
+    """
+    Zwraca decyzję na podstawie reguł
+    """
+
+    decision = "NO_TRADE"
+    reasons = []
+    score = 0
+
+    # 1️⃣ Confidence
+    if parsed["confidence"] == "HIGH":
+        score += 1
+    else:
+        reasons.append("Low confidence")
+
+    # 2️⃣ Placeholder SMA200 (docelowo z historycznych danych)
+    sma200_trend = "above"  # symulacja
+    if parsed["action"] == "buy" and sma200_trend == "above":
+        score += 1
+    elif parsed["action"] == "sell" and sma200_trend == "below":
+        score += 1
+    else:
+        reasons.append("Against SMA200")
+
+    # 3️⃣ Placeholder stochastic
+    stochastic_signal = "bullish"  # symulacja
+    if parsed["action"] == "buy" and stochastic_signal == "bullish":
+        score += 1
+    elif parsed["action"] == "sell" and stochastic_signal == "bearish":
+        score += 1
+    else:
+        reasons.append("Stochastic not aligned")
+
+    # ✅ Decyzja końcowa
+    if score >= 3:
+        decision = "BUY" if parsed["action"] == "buy" else "SELL"
+
+    return {
+        "decision": decision,
+        "score": score,
+        "reasons": reasons
+    }
+
+# ==================================================
 # 🌐 WEBHOOK
 # ==================================================
 @app.post("/webhook")
 async def webhook(request: Request):
     token = request.query_params.get("token")
 
-    # 1️⃣ Zabezpieczenie webhooka
     if token != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-    # 2️⃣ Odczyt body (działa nawet gdy EMPTY)
     raw_body = await request.body()
     text = raw_body.decode("utf-8") if raw_body else "EMPTY"
 
-    # 3️⃣ Log surowy
     print("📩 Webhook received")
     print("Raw body:", text)
 
-    # 4️⃣ Parsowanie
     parsed = parse_signal(text)
     print("🧠 Parsed signal:", parsed)
 
-    # 5️⃣ Cena rynkowa (NIGDY NIE MOŻE WYWRÓCIĆ WEBHOOKA)
-    price = None
+    live_price = None
+    evaluation = None
 
-    if parsed and parsed.get("symbol") and parsed["symbol"] != "UNKNOWN":
-        if TWELVE_API_KEY:
-            try:
-                price = get_live_price(parsed["symbol"])
-                print("✅ Live price:", price)
-            except Exception as e:
-                print("❌ TwelveData error:", e)
-        else:
-            print("⚠️ TWELVE_API_KEY not set – skipping price fetch")
+    if parsed and parsed["symbol"] != "UNKNOWN":
+        try:
+            live_price = get_live_price(parsed["symbol"])
+            print("✅ Live price:", live_price)
 
-    # 6️⃣ ZAWSZE ZWRACAMY ODP.
+            evaluation = evaluate_trade(parsed, live_price)
+            print("🧪 Evaluation:", evaluation)
+
+        except Exception as e:
+            print("❌ Error:", e)
+
     return {
         "status": "ok",
         "parsed": parsed,
-        "live_price": price
+        "live_price": live_price,
+        "evaluation": evaluation
     }
