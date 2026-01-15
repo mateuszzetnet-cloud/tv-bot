@@ -18,6 +18,9 @@ TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 DB_FILE = "trading.db"
 START_BALANCE = 10_000.0
 
+# === RISK ===
+RISK_PER_TRADE = 0.01  # 1% balance
+
 TP_POINTS = 20
 SL_POINTS = 10
 POINT_VALUE = 1.0  # $ per point per 1 lot
@@ -80,15 +83,11 @@ def parse_signal(text: str):
     if symbol not in SYMBOL_MAP:
         return None
 
-    size_match = re.search(r"@\s*([0-9.]+)", t)
-    lot = float(size_match.group(1)) if size_match else 0.1
-
     confidence = "HIGH" if "high" in t else "NORMAL"
 
     return {
         "symbol": symbol,
         "action": action,
-        "lot": lot,
         "confidence": confidence,
         "raw": text.strip()
     }
@@ -147,7 +146,7 @@ def evaluate_trade(parsed, price, sma200):
     return "approved" if not reasons else "rejected", reasons
 
 # ==================================================
-# 📊 BALANCE
+# 📊 BALANCE + RISK
 # ==================================================
 def get_balance():
     cur = db().execute("SELECT balance FROM balance ORDER BY time DESC LIMIT 1")
@@ -160,10 +159,17 @@ def update_balance(delta):
         (datetime.utcnow().isoformat(), new_balance)
     ).connection.commit()
 
+def calculate_lot_size():
+    balance = get_balance()
+    risk_usd = balance * RISK_PER_TRADE
+    lot = risk_usd / (SL_POINTS * POINT_VALUE)
+    return round(max(lot, 0.01), 2)
+
 # ==================================================
 # 📄 PAPER TRADING ENGINE
 # ==================================================
 def open_trade(parsed, price):
+    lot = calculate_lot_size()
     with db() as con:
         con.execute("""
         INSERT INTO trades
@@ -173,7 +179,7 @@ def open_trade(parsed, price):
             parsed["symbol"],
             parsed["action"],
             price,
-            parsed["lot"],
+            lot,
             datetime.utcnow().isoformat()
         ))
 
@@ -205,7 +211,6 @@ def manage_open_trades(symbol, current_price, new_signal_action=None):
         direction = 1 if action == "buy" else -1
         diff = (current_price - entry) * direction
 
-        # TP / SL
         if diff >= TP_POINTS:
             pnl = TP_POINTS * lot * POINT_VALUE
             close_trade(trade_id, current_price, pnl)
@@ -214,7 +219,6 @@ def manage_open_trades(symbol, current_price, new_signal_action=None):
             pnl = -SL_POINTS * lot * POINT_VALUE
             close_trade(trade_id, current_price, pnl)
 
-        # Opposite signal
         elif new_signal_action and new_signal_action != action:
             pnl = diff * lot * POINT_VALUE
             close_trade(trade_id, current_price, pnl)
@@ -246,8 +250,9 @@ async def webhook(request: Request):
         "status": decision,
         "price": price,
         "sma200": sma200,
-        "reasons": reasons,
-        "balance": get_balance()
+        "balance": get_balance(),
+        "risk_pct": RISK_PER_TRADE,
+        "reasons": reasons
     }
 
 # ==================================================
@@ -264,5 +269,6 @@ def stats():
     return {
         "balance": get_balance(),
         "total_pnl": total_pnl,
+        "open_risk_pct": RISK_PER_TRADE,
         "trades": trades
     }
