@@ -10,11 +10,13 @@ from fastapi import FastAPI, Request, HTTPException
 # 🔧 APP + LOGGING
 # ==================================================
 app = FastAPI()
-
 logging.basicConfig(level=logging.WARNING)
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
+
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", 10000))  # USD
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", 0.01))        # 1%
 
 if not WEBHOOK_SECRET or not TWELVE_API_KEY:
     logging.warning("Missing environment variables")
@@ -44,7 +46,7 @@ def parse_signal(text: str):
         return None
 
     size_match = re.search(r"@\s*([0-9.]+)", t)
-    size = float(size_match.group(1)) if size_match else None
+    size = float(size_match.group(1)) if size_match else None  # ignorowane w execution
 
     tf_match = re.search(r"\((m\d+)\)", t)
     timeframe = tf_match.group(1).upper() if tf_match else "M15"
@@ -96,7 +98,7 @@ def get_sma200(symbol: str, interval="15min"):
     if data and "values" in data and data["values"]:
         return float(data["values"][0]["sma"])
 
-    # 🔁 fallback M15 → H1
+    # fallback M15 → H1
     if interval == "15min":
         return get_sma200(symbol, "1h")
 
@@ -125,6 +127,31 @@ def evaluate_trade(parsed, price, sma200):
 
     decision = "approved" if not reasons else "rejected"
     return decision, reasons
+
+# ==================================================
+# 💰 RISK / SL / TP  (ETAP 7)
+# ==================================================
+def calculate_risk_amount(balance: float, risk_percent: float):
+    return balance * risk_percent
+
+def calculate_sl_tp(action: str, entry_price: float):
+    """
+    Safe preset:
+    SL = 0.5%
+    TP = 1.0%
+    RR = 1:2
+    """
+    sl_pct = 0.005
+    tp_pct = 0.01
+
+    if action == "buy":
+        sl = entry_price * (1 - sl_pct)
+        tp = entry_price * (1 + tp_pct)
+    else:
+        sl = entry_price * (1 + sl_pct)
+        tp = entry_price * (1 - tp_pct)
+
+    return round(sl, 2), round(tp, 2)
 
 # ==================================================
 # 🧾 STORAGE
@@ -182,21 +209,37 @@ async def webhook(request: Request):
     sma200 = get_sma200(parsed["symbol"])
     decision, reasons = evaluate_trade(parsed, price, sma200)
 
+    risk_amount = calculate_risk_amount(ACCOUNT_BALANCE, RISK_PERCENT)
+
+    stop_loss = take_profit = None
+    if price:
+        stop_loss, take_profit = calculate_sl_tp(parsed["action"], price)
+
     log_trade({
         "time": datetime.utcnow().isoformat(),
         **parsed,
         "price": price,
         "sma200": sma200,
         "decision": decision,
-        "reasons": reasons
+        "reasons": reasons,
+        "account_balance": ACCOUNT_BALANCE,
+        "risk_percent": RISK_PERCENT,
+        "risk_amount": round(risk_amount, 2),
+        "stop_loss": stop_loss,
+        "take_profit": take_profit
     })
 
     return {
         "status": "ok",
         "decision": decision,
-        "reasons": reasons,
-        "price": price,
-        "sma200": sma200
+        "symbol": parsed["symbol"],
+        "action": parsed["action"],
+        "entry": price,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "risk_usd": round(risk_amount, 2),
+        "confidence": parsed["confidence"],
+        "reasons": reasons
     }
 
 # ==================================================
