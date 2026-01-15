@@ -19,9 +19,9 @@ DB_FILE = "trading.db"
 START_BALANCE = 10_000.0
 
 # === RISK ===
-RISK_PER_TRADE = 0.01      # 1%
-MAX_DAILY_LOSS = 0.03      # 3%
-MAX_DRAWDOWN = 0.10        # 10%
+RISK_PER_TRADE = 0.01
+MAX_DAILY_LOSS = 0.03
+MAX_DRAWDOWN = 0.10
 
 TP_POINTS = 20
 SL_POINTS = 10
@@ -235,6 +235,11 @@ def close_trade(trade_id, pnl, price):
     set_state("daily_pnl", float(get_state("daily_pnl")) + pnl)
 
 def manage_trades(symbol, price, new_action):
+    # ✅ OBOWIĄZKOWY GUARD
+    if price is None:
+        logging.warning("Price unavailable – skipping trade management")
+        return
+
     cur = db().execute("""
         SELECT id, action, entry_price, lot
         FROM trades WHERE status='OPEN' AND symbol=?
@@ -288,6 +293,9 @@ async def webhook(request: Request):
         return {"status": "ignored"}
 
     price = get_price(parsed["symbol"])
+    if price is None:  # ✅ OPCJONALNY GUARD
+        return {"status": "no_price"}
+
     sma = get_sma200(parsed["symbol"])
 
     manage_trades(parsed["symbol"], price, parsed["action"])
