@@ -1,151 +1,148 @@
 import os
 import re
+import json
 import requests
+from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 
 app = FastAPI()
 
 # ==================================================
-# 🔐 ENV
+# 🔐 ZMIENNE ŚRODOWISKOWE
 # ==================================================
 WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
 # ==================================================
-# ⚙️ RISK
-# ==================================================
-ACCOUNT_BALANCE = 10_000
-RISK_PERCENT = 0.01
-
-# ==================================================
-# SYMBOL MAP
+# 🔁 MAPOWANIE SYMBOLI
 # ==================================================
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
 }
 
 # ==================================================
-# PARSER
+# 🔎 PARSER SYGNAŁU
 # ==================================================
-def parse_signal(text):
-    if not text:
+def parse_signal(text: str):
+    if not text or text == "EMPTY":
         return None
 
     t = text.lower()
+
+    action = "buy" if "buy" in t else "sell" if "sell" in t else None
+    symbol_match = re.search(r"(xauusd)", t)
+    symbol = symbol_match.group(1).upper() if symbol_match else "UNKNOWN"
+
+    size_match = re.search(r"@\s*([0-9.]+)", t)
+    size = float(size_match.group(1)) if size_match else None
+
+    tf_match = re.search(r"\((m\d+)\)", t)
+    timeframe = tf_match.group(1).upper() if tf_match else "M15"
+
+    confidence = "HIGH" if "high" in t else "NORMAL"
+
     return {
-        "symbol": "XAUUSD" if "xauusd" in t else "UNKNOWN",
-        "action": "buy" if "buy" in t else "sell" if "sell" in t else None,
-        "confidence": "HIGH" if "high" in t else "NORMAL",
-        "timeframe": "M15"
+        "symbol": symbol,
+        "action": action,
+        "size": size,
+        "timeframe": timeframe,
+        "confidence": confidence,
+        "raw": text
     }
 
 # ==================================================
-# DATA
+# 📈 LIVE PRICE
 # ==================================================
-def td_request(endpoint, params):
-    r = requests.get(
-        f"https://api.twelvedata.com/{endpoint}",
-        params={**params, "apikey": TWELVE_API_KEY},
-        timeout=5
-    )
-    return r.json()
-
-def get_price(symbol):
-    return float(td_request("price", {"symbol": SYMBOL_MAP[symbol]})["price"])
-
-def get_sma200(symbol):
-    data = td_request("sma", {
-        "symbol": SYMBOL_MAP[symbol],
-        "interval": "H1",
-        "time_period": 200
-    })
-    return float(data["values"][-1]["sma"])
-
-def get_stochastic(symbol):
-    data = td_request("stoch", {
-        "symbol": SYMBOL_MAP[symbol],
-        "interval": "M15"
-    })
-    last = data["values"][-1]
-    return float(last["slow_k"]), float(last["slow_d"])
-
-def get_atr(symbol):
-    data = td_request("atr", {
-        "symbol": SYMBOL_MAP[symbol],
-        "interval": "M15",
-        "time_period": 14
-    })
-    return float(data["values"][-1]["atr"])
+def get_live_price(symbol: str):
+    mapped = SYMBOL_MAP.get(symbol)
+    url = "https://api.twelvedata.com/price"
+    r = requests.get(url, params={"symbol": mapped, "apikey": TWELVE_API_KEY}, timeout=5)
+    return float(r.json()["price"])
 
 # ==================================================
-# TRADE FILTER
+# 📊 SMA200 (M15 → fallback H1)
 # ==================================================
-def evaluate_trade(parsed, price):
+def get_sma200(symbol: str, interval="15min"):
+    mapped = SYMBOL_MAP.get(symbol)
+    url = "https://api.twelvedata.com/sma"
+    params = {
+        "symbol": mapped,
+        "interval": interval,
+        "time_period": 200,
+        "apikey": TWELVE_API_KEY
+    }
+    r = requests.get(url, params=params, timeout=5)
+    data = r.json()
+
+    if "values" in data:
+        return float(data["values"][0]["sma"])
+
+    if interval == "15min":
+        return get_sma200(symbol, "1h")
+
+    return None
+
+# ==================================================
+# 🧠 EVALUATE TRADE
+# ==================================================
+def evaluate_trade(parsed, price, sma200):
     reasons = []
 
     if parsed["confidence"] != "HIGH":
-        reasons.append("confidence_not_high")
+        reasons.append("low_confidence")
 
-    sma200 = get_sma200(parsed["symbol"])
-    stochastic_k, stochastic_d = get_stochastic(parsed["symbol"])
-
-    if parsed["action"] == "buy":
-        if price <= sma200:
+    if sma200:
+        if parsed["action"] == "buy" and price < sma200:
             reasons.append("price_below_sma200")
-        if stochastic_k > 20:
-            reasons.append("stochastic_not_oversold")
-
-    if parsed["action"] == "sell":
-        if price >= sma200:
+        if parsed["action"] == "sell" and price > sma200:
             reasons.append("price_above_sma200")
-        if stochastic_k < 80:
-            reasons.append("stochastic_not_overbought")
 
-    return reasons
-
-# ==================================================
-# SL / TP / SIZE
-# ==================================================
-def sl_tp(price, atr, action):
-    sl = price - atr * 1.5 if action == "buy" else price + atr * 1.5
-    tp = price + atr * 3 if action == "buy" else price - atr * 3
-    return sl, tp
-
-def position_size(price, sl):
-    risk_usd = ACCOUNT_BALANCE * RISK_PERCENT
-    return round(risk_usd / (abs(price - sl) * 100), 2)
+    decision = "approved" if not reasons else "rejected"
+    return decision, reasons
 
 # ==================================================
-# WEBHOOK
+# 🧾 LEARNING MEMORY (LOG)
+# ==================================================
+def log_trade(data: dict):
+    with open("trades_log.jsonl", "a") as f:
+        f.write(json.dumps(data) + "\n")
+
+# ==================================================
+# 🌐 WEBHOOK
 # ==================================================
 @app.post("/webhook")
 async def webhook(request: Request):
-    if request.query_params.get("token") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403)
+    token = request.query_params.get("token")
+    if token != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid token")
 
-    text = (await request.body()).decode()
+    body = await request.body()
+    text = body.decode("utf-8") if body else "EMPTY"
+
     parsed = parse_signal(text)
+    if not parsed:
+        return {"status": "ignored"}
 
-    price = get_price(parsed["symbol"])
-    atr = get_atr(parsed["symbol"])
+    price = get_live_price(parsed["symbol"])
+    sma200 = get_sma200(parsed["symbol"])
 
-    reject_reasons = evaluate_trade(parsed, price)
+    decision, reasons = evaluate_trade(parsed, price, sma200)
 
-    if reject_reasons:
-        return {
-            "status": "rejected",
-            "reasons": reject_reasons
-        }
-
-    sl, tp = sl_tp(price, atr, parsed["action"])
-    size = position_size(price, sl)
-
-    return {
-        "status": "approved",
+    trade_log = {
+        "time": datetime.utcnow().isoformat(),
         "symbol": parsed["symbol"],
         "action": parsed["action"],
-        "price": round(price, 2),
-        "sl": round(sl, 2),
-        "tp": round(tp, 2),
-        "size_lots": size
+        "price": price,
+        "sma200": sma200,
+        "confidence": parsed["confidence"],
+        "decision": decision,
+        "reasons": reasons
+    }
+
+    log_trade(trade_log)
+
+    return {
+        "status": "ok",
+        "decision": decision,
+        "reasons": reasons
     }
