@@ -25,6 +25,7 @@ MAX_DRAWDOWN = 0.10
 
 TP_POINTS = 20
 SL_POINTS = 10
+TRAIL_AFTER = TP_POINTS / 2
 POINT_VALUE = 1.0
 
 SYMBOL_MAP = {
@@ -49,6 +50,7 @@ def init_db():
             lot REAL,
             status TEXT,
             pnl REAL,
+            trailing_sl REAL,
             time_open TEXT,
             time_close TEXT
         )
@@ -98,14 +100,13 @@ def parse_signal(text: str):
     if not action:
         return None
 
-    symbol = "XAUUSD" if "xauusd" in t else None
-    if symbol not in SYMBOL_MAP:
+    if "xauusd" not in t:
         return None
 
     confidence = "HIGH" if "high" in t else "NORMAL"
 
     return {
-        "symbol": symbol,
+        "symbol": "XAUUSD",
         "action": action,
         "confidence": confidence,
         "raw": text.strip()
@@ -200,14 +201,14 @@ def evaluate_trade(parsed, price, sma):
     return True
 
 # ==================================================
-# 📄 PAPER ENGINE
+# 📄 PAPER ENGINE + TRAILING SL
 # ==================================================
 def open_trade(parsed, price):
     lot = calculate_lot()
     db().execute("""
         INSERT INTO trades
-        (symbol, action, entry_price, lot, status, pnl, time_open)
-        VALUES (?, ?, ?, ?, 'OPEN', 0, ?)
+        (symbol, action, entry_price, lot, status, pnl, trailing_sl, time_open)
+        VALUES (?, ?, ?, ?, 'OPEN', 0, NULL, ?)
     """, (
         parsed["symbol"],
         parsed["action"],
@@ -235,24 +236,35 @@ def close_trade(trade_id, pnl, price):
     set_state("daily_pnl", float(get_state("daily_pnl")) + pnl)
 
 def manage_trades(symbol, price, new_action):
-    # ✅ OBOWIĄZKOWY GUARD
     if price is None:
-        logging.warning("Price unavailable – skipping trade management")
         return
 
     cur = db().execute("""
-        SELECT id, action, entry_price, lot
+        SELECT id, action, entry_price, lot, trailing_sl
         FROM trades WHERE status='OPEN' AND symbol=?
     """, (symbol,))
 
-    for tid, action, entry, lot in cur.fetchall():
+    for tid, action, entry, lot, tsl in cur.fetchall():
         dir = 1 if action == "buy" else -1
         diff = (price - entry) * dir
 
+        # 🎯 Trailing SL activation
+        if diff >= TRAIL_AFTER:
+            new_tsl = entry + (diff - SL_POINTS) * dir
+            if tsl is None or (new_tsl * dir) > (tsl * dir):
+                db().execute(
+                    "UPDATE trades SET trailing_sl=? WHERE id=?",
+                    (new_tsl, tid)
+                ).connection.commit()
+                tsl = new_tsl
+
+        # 🧨 Exit logic
         if diff >= TP_POINTS:
             close_trade(tid, TP_POINTS * lot * POINT_VALUE, price)
         elif diff <= -SL_POINTS:
             close_trade(tid, -SL_POINTS * lot * POINT_VALUE, price)
+        elif tsl and (price - tsl) * dir <= 0:
+            close_trade(tid, diff * lot * POINT_VALUE, price)
         elif new_action != action:
             close_trade(tid, diff * lot * POINT_VALUE, price)
 
@@ -293,16 +305,15 @@ async def webhook(request: Request):
         return {"status": "ignored"}
 
     price = get_price(parsed["symbol"])
-    if price is None:  # ✅ OPCJONALNY GUARD
+    if price is None:
         return {"status": "no_price"}
 
     sma = get_sma200(parsed["symbol"])
 
     manage_trades(parsed["symbol"], price, parsed["action"])
 
-    status = check_risk_locks()
-    if status != "ACTIVE":
-        return {"status": "blocked", "engine": status}
+    if check_risk_locks() != "ACTIVE":
+        return {"status": "blocked"}
 
     if evaluate_trade(parsed, price, sma):
         open_trade(parsed, price)
@@ -324,4 +335,26 @@ def stats():
         "daily_pnl": float(get_state("daily_pnl")),
         "peak_balance": float(get_state("peak_balance")),
         "trades": trades
+    }
+
+# ==================================================
+# 📈 PERFORMANCE (ETAP 13)
+# ==================================================
+@app.get("/performance")
+def performance():
+    cur = db().execute("""
+        SELECT pnl FROM trades WHERE status='CLOSED'
+    """)
+    pnls = [r[0] for r in cur.fetchall()]
+
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+
+    return {
+        "trades": len(pnls),
+        "win_rate": round(len(wins) / len(pnls), 2) if pnls else 0,
+        "profit_factor": round(sum(wins) / abs(sum(losses)), 2) if losses else None,
+        "avg_win": round(sum(wins) / len(wins), 2) if wins else 0,
+        "avg_loss": round(sum(losses) / len(losses), 2) if losses else 0,
+        "net_pnl": sum(pnls)
     }
