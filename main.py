@@ -1,39 +1,69 @@
 import os
 import re
-import json
+import sqlite3
 import requests
 import logging
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 
 # ==================================================
-# 🔧 APP + LOGGING
+# 🔧 APP
 # ==================================================
 app = FastAPI()
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
-ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", 10000))  # USD
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", 0.01))        # 1%
-
-if not WEBHOOK_SECRET or not TWELVE_API_KEY:
-    logging.warning("Missing environment variables")
+DB_FILE = "trading.db"
+START_BALANCE = 10_000.0  # paper account
 
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
 }
 
-LOG_FILE = "trades_log.jsonl"
+# ==================================================
+# 🗄️ DATABASE
+# ==================================================
+def db():
+    return sqlite3.connect(DB_FILE, check_same_thread=False)
+
+def init_db():
+    with db() as con:
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            action TEXT,
+            entry_price REAL,
+            lot REAL,
+            status TEXT,
+            pnl REAL,
+            time_open TEXT,
+            time_close TEXT
+        )
+        """)
+
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS balance (
+            time TEXT,
+            balance REAL
+        )
+        """)
+
+        cur = con.execute("SELECT COUNT(*) FROM balance")
+        if cur.fetchone()[0] == 0:
+            con.execute(
+                "INSERT INTO balance VALUES (?, ?)",
+                (datetime.utcnow().isoformat(), START_BALANCE)
+            )
+
+init_db()
 
 # ==================================================
 # 🔎 PARSER
 # ==================================================
 def parse_signal(text: str):
-    if not text:
-        return None
-
     t = text.lower()
 
     action = "buy" if "buy" in t else "sell" if "sell" in t else None
@@ -46,18 +76,14 @@ def parse_signal(text: str):
         return None
 
     size_match = re.search(r"@\s*([0-9.]+)", t)
-    size = float(size_match.group(1)) if size_match else None  # ignorowane w execution
-
-    tf_match = re.search(r"\((m\d+)\)", t)
-    timeframe = tf_match.group(1).upper() if tf_match else "M15"
+    lot = float(size_match.group(1)) if size_match else 0.1
 
     confidence = "HIGH" if "high" in t else "NORMAL"
 
     return {
         "symbol": symbol,
         "action": action,
-        "size": size,
-        "timeframe": timeframe,
+        "lot": lot,
         "confidence": confidence,
         "raw": text.strip()
     }
@@ -68,23 +94,18 @@ def parse_signal(text: str):
 def safe_request(url, params):
     try:
         r = requests.get(url, params=params, timeout=5)
-        data = r.json()
-        if "status" in data and data["status"] == "error":
-            return None
-        return data
+        return r.json()
     except Exception:
         return None
 
-def get_live_price(symbol: str):
+def get_price(symbol):
     data = safe_request(
         "https://api.twelvedata.com/price",
         {"symbol": SYMBOL_MAP[symbol], "apikey": TWELVE_API_KEY}
     )
-    if not data or "price" not in data:
-        return None
-    return float(data["price"])
+    return float(data["price"]) if data and "price" in data else None
 
-def get_sma200(symbol: str, interval="15min"):
+def get_sma200(symbol, interval="15min"):
     data = safe_request(
         "https://api.twelvedata.com/sma",
         {
@@ -94,18 +115,16 @@ def get_sma200(symbol: str, interval="15min"):
             "apikey": TWELVE_API_KEY
         }
     )
-
-    if data and "values" in data and data["values"]:
+    if data and "values" in data:
         return float(data["values"][0]["sma"])
 
-    # fallback M15 → H1
     if interval == "15min":
         return get_sma200(symbol, "1h")
 
     return None
 
 # ==================================================
-# 🧠 EVALUATION
+# 🧠 STRATEGY
 # ==================================================
 def evaluate_trade(parsed, price, sma200):
     reasons = []
@@ -113,138 +132,83 @@ def evaluate_trade(parsed, price, sma200):
     if parsed["confidence"] != "HIGH":
         reasons.append("low_confidence")
 
-    if price is None:
-        reasons.append("no_price")
-
-    if sma200 is None:
-        reasons.append("no_sma200")
+    if price is None or sma200 is None:
+        reasons.append("no_market_data")
 
     if price and sma200:
         if parsed["action"] == "buy" and price < sma200:
-            reasons.append("price_below_sma200")
+            reasons.append("below_sma200")
         if parsed["action"] == "sell" and price > sma200:
-            reasons.append("price_above_sma200")
+            reasons.append("above_sma200")
 
-    decision = "approved" if not reasons else "rejected"
-    return decision, reasons
-
-# ==================================================
-# 💰 RISK / SL / TP  (ETAP 7)
-# ==================================================
-def calculate_risk_amount(balance: float, risk_percent: float):
-    return balance * risk_percent
-
-def calculate_sl_tp(action: str, entry_price: float):
-    """
-    Safe preset:
-    SL = 0.5%
-    TP = 1.0%
-    RR = 1:2
-    """
-    sl_pct = 0.005
-    tp_pct = 0.01
-
-    if action == "buy":
-        sl = entry_price * (1 - sl_pct)
-        tp = entry_price * (1 + tp_pct)
-    else:
-        sl = entry_price * (1 + sl_pct)
-        tp = entry_price * (1 - tp_pct)
-
-    return round(sl, 2), round(tp, 2)
+    return "approved" if not reasons else "rejected", reasons
 
 # ==================================================
-# 🧾 STORAGE
+# 📊 BALANCE
 # ==================================================
-def log_trade(data: dict):
-    try:
-        with open(LOG_FILE, "a") as f:
-            f.write(json.dumps(data) + "\n")
-    except Exception:
-        logging.warning("Failed to write trade log")
+def get_balance():
+    cur = db().execute("SELECT balance FROM balance ORDER BY time DESC LIMIT 1")
+    return cur.fetchone()[0]
 
-def load_trades():
-    if not os.path.exists(LOG_FILE):
-        return []
-    with open(LOG_FILE, "r") as f:
-        return [json.loads(line) for line in f if line.strip()]
+def update_balance(new_balance):
+    db().execute(
+        "INSERT INTO balance VALUES (?, ?)",
+        (datetime.utcnow().isoformat(), new_balance)
+    ).connection.commit()
 
 # ==================================================
-# 📊 STATS
+# 📄 PAPER TRADE ENGINE
 # ==================================================
-def calculate_stats(trades):
-    stats = {
-        "total": len(trades),
-        "approved": 0,
-        "rejected": 0,
-        "rejection_reasons": {},
-        "confidence": {"HIGH": 0, "NORMAL": 0},
-    }
-
-    for t in trades:
-        stats[t["decision"]] += 1
-        stats["confidence"][t["confidence"]] += 1
-
-        for r in t["reasons"]:
-            stats["rejection_reasons"][r] = stats["rejection_reasons"].get(r, 0) + 1
-
-    return stats
+def open_trade(parsed, price):
+    with db() as con:
+        con.execute("""
+        INSERT INTO trades
+        (symbol, action, entry_price, lot, status, pnl, time_open)
+        VALUES (?, ?, ?, ?, 'OPEN', 0, ?)
+        """, (
+            parsed["symbol"],
+            parsed["action"],
+            price,
+            parsed["lot"],
+            datetime.utcnow().isoformat()
+        ))
 
 # ==================================================
 # 🌐 WEBHOOK
 # ==================================================
 @app.post("/webhook")
 async def webhook(request: Request):
-    token = request.query_params.get("token")
-    if token != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid token")
+    if request.query_params.get("token") != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403)
 
-    body = (await request.body()).decode("utf-8").strip()
+    body = (await request.body()).decode()
     parsed = parse_signal(body)
-
     if not parsed:
         return {"status": "ignored"}
 
-    price = get_live_price(parsed["symbol"])
+    price = get_price(parsed["symbol"])
     sma200 = get_sma200(parsed["symbol"])
     decision, reasons = evaluate_trade(parsed, price, sma200)
 
-    risk_amount = calculate_risk_amount(ACCOUNT_BALANCE, RISK_PERCENT)
-
-    stop_loss = take_profit = None
-    if price:
-        stop_loss, take_profit = calculate_sl_tp(parsed["action"], price)
-
-    log_trade({
-        "time": datetime.utcnow().isoformat(),
-        **parsed,
-        "price": price,
-        "sma200": sma200,
-        "decision": decision,
-        "reasons": reasons,
-        "account_balance": ACCOUNT_BALANCE,
-        "risk_percent": RISK_PERCENT,
-        "risk_amount": round(risk_amount, 2),
-        "stop_loss": stop_loss,
-        "take_profit": take_profit
-    })
+    if decision == "approved":
+        open_trade(parsed, price)
 
     return {
-        "status": "ok",
-        "decision": decision,
-        "symbol": parsed["symbol"],
-        "action": parsed["action"],
-        "entry": price,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "risk_usd": round(risk_amount, 2),
-        "confidence": parsed["confidence"],
+        "status": decision,
+        "price": price,
+        "sma200": sma200,
         "reasons": reasons
     }
 
 # ==================================================
-# 📊 STATS ENDPOINT
+# 📊 STATS
 # ==================================================
 @app.get("/stats")
 def stats():
-    return calculate_stats(load_trades())
+    cur = db().execute("SELECT status, COUNT(*) FROM trades GROUP BY status")
+    trades = dict(cur.fetchall())
+
+    return {
+        "balance": get_balance(),
+        "trades": trades
+    }
