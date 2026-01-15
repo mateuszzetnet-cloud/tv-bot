@@ -6,49 +6,39 @@ from fastapi import FastAPI, Request, HTTPException
 app = FastAPI()
 
 # ==================================================
-# 🔐 ZMIENNE ŚRODOWISKOWE
+# 🔐 ENV
 # ==================================================
 WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
 # ==================================================
-# 🔁 MAPOWANIE SYMBOLI (TradingView → TwelveData)
+# 🔁 SYMBOL MAP
 # ==================================================
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
-    "BTCUSDT": "BTC/USD",
-    "ETHUSDT": "ETH/USD",
-    "EURUSD": "EUR/USD",
 }
 
 # ==================================================
-# 🔎 PARSER SYGNAŁU
+# 🔎 PARSER
 # ==================================================
 def parse_signal(text: str):
-    if not text or text == "EMPTY":
+    if not text:
         return None
 
-    text_lower = text.lower()
+    t = text.lower()
 
-    action = None
-    if "buy" in text_lower:
-        action = "buy"
-    elif "sell" in text_lower:
-        action = "sell"
+    action = "buy" if "buy" in t else "sell" if "sell" in t else None
+    symbol = "XAUUSD" if "xauusd" in t else "UNKNOWN"
 
-    symbol_match = re.search(r"(xauusd|eurusd|btcusdt|ethusdt)", text_lower)
-    symbol = symbol_match.group(1).upper() if symbol_match else "UNKNOWN"
-
-    size_match = re.search(r"@\s*([0-9.]+)", text_lower)
+    size_match = re.search(r"@\s*([0-9.]+)", t)
     size = float(size_match.group(1)) if size_match else None
 
-    tf_match = re.search(r"\((m\d+)\)", text_lower)
+    tf_match = re.search(r"\((m\d+)\)", t)
     timeframe = tf_match.group(1).upper() if tf_match else None
 
-    confidence = "HIGH" if "high" in text_lower else "NORMAL"
+    confidence = "HIGH" if "high" in t else "NORMAL"
 
     return {
-        "source": "tradingview",
         "symbol": symbol,
         "action": action,
         "size": size,
@@ -58,61 +48,89 @@ def parse_signal(text: str):
     }
 
 # ==================================================
-# 📈 TWELVE DATA – LIVE PRICE
+# 📈 LIVE PRICE
 # ==================================================
-def get_live_price(symbol: str):
-    if not TWELVE_API_KEY:
-        raise Exception("TWELVE_API_KEY not set")
-
-    mapped_symbol = SYMBOL_MAP.get(symbol, symbol)
-    print(f"📈 TwelveData symbol: {mapped_symbol}")
-
-    url = "https://api.twelvedata.com/price"
-    params = {
-        "symbol": mapped_symbol,
-        "apikey": TWELVE_API_KEY
-    }
-
-    r = requests.get(url, params=params, timeout=5)
-    data = r.json()
-
-    if "price" not in data:
-        raise Exception(data)
-
-    return float(data["price"])
+def get_live_price(symbol):
+    r = requests.get(
+        "https://api.twelvedata.com/price",
+        params={
+            "symbol": SYMBOL_MAP[symbol],
+            "apikey": TWELVE_API_KEY
+        },
+        timeout=5
+    )
+    return float(r.json()["price"])
 
 # ==================================================
-# 🧠 ETAP 1 – ENGINE DECYZYJNY
+# 📊 SMA200
 # ==================================================
-def evaluate_trade(parsed: dict):
-    """
-    Zwraca:
-    {
-        decision: BUY / SELL / REJECT
-        reason: tekst
-    }
-    """
+def get_sma200(symbol, timeframe):
+    r = requests.get(
+        "https://api.twelvedata.com/time_series",
+        params={
+            "symbol": SYMBOL_MAP[symbol],
+            "interval": timeframe.lower(),
+            "outputsize": 200,
+            "apikey": TWELVE_API_KEY
+        },
+        timeout=8
+    )
 
-    if not parsed:
-        return {"decision": "REJECT", "reason": "Empty signal"}
+    candles = r.json().get("values", [])
+    closes = [float(c["close"]) for c in candles]
 
-    if parsed["symbol"] == "UNKNOWN":
-        return {"decision": "REJECT", "reason": "Unknown symbol"}
+    if len(closes) < 200:
+        raise Exception("Not enough data for SMA200")
 
-    if parsed["action"] not in ("buy", "sell"):
-        return {"decision": "REJECT", "reason": "No action"}
+    return sum(closes) / len(closes)
 
+# ==================================================
+# 📉 STOCHASTIC (14,3)
+# ==================================================
+def get_stochastic(symbol, timeframe):
+    r = requests.get(
+        "https://api.twelvedata.com/stochastic",
+        params={
+            "symbol": SYMBOL_MAP[symbol],
+            "interval": timeframe.lower(),
+            "apikey": TWELVE_API_KEY
+        },
+        timeout=8
+    )
+
+    values = r.json().get("values", [])
+    if len(values) < 2:
+        raise Exception("Not enough stochastic data")
+
+    k_now = float(values[0]["k"])
+    k_prev = float(values[1]["k"])
+
+    return k_now, k_prev
+
+# ==================================================
+# 🧠 EVALUATE TRADE (PRO CORE)
+# ==================================================
+def evaluate_trade(parsed, price, sma200, k_now, k_prev):
     if parsed["confidence"] != "HIGH":
         return {"decision": "REJECT", "reason": "Low confidence"}
 
-    # ETAP 1 → jeśli przeszedł sanity + confidence
+    # BUY LOGIC
     if parsed["action"] == "buy":
-        return {"decision": "BUY", "reason": "Basic rules passed"}
+        if price <= sma200:
+            return {"decision": "REJECT", "reason": "Price below SMA200"}
+        if not (k_now < 20 and k_now > k_prev):
+            return {"decision": "REJECT", "reason": "Stochastic not rising from oversold"}
+        return {"decision": "BUY", "reason": "Trend + momentum confirmed"}
 
+    # SELL LOGIC
     if parsed["action"] == "sell":
-        return {"decision": "SELL", "reason": "Basic rules passed"}
+        if price >= sma200:
+            return {"decision": "REJECT", "reason": "Price above SMA200"}
+        if not (k_now > 80 and k_now < k_prev):
+            return {"decision": "REJECT", "reason": "Stochastic not falling from overbought"}
+        return {"decision": "SELL", "reason": "Trend + momentum confirmed"}
 
-    return {"decision": "REJECT", "reason": "Fallback reject"}
+    return {"decision": "REJECT", "reason": "Invalid action"}
 
 # ==================================================
 # 🌐 WEBHOOK
@@ -120,33 +138,38 @@ def evaluate_trade(parsed: dict):
 @app.post("/webhook")
 async def webhook(request: Request):
     token = request.query_params.get("token")
-
     if token != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-    raw_body = await request.body()
-    text = raw_body.decode("utf-8") if raw_body else "EMPTY"
+    body = await request.body()
+    text = body.decode() if body else ""
 
-    print("📩 Webhook received")
-    print("Raw body:", text)
+    print("📩 Webhook:", text)
 
     parsed = parse_signal(text)
-    print("🧠 Parsed signal:", parsed)
+    print("🧠 Parsed:", parsed)
 
-    decision = evaluate_trade(parsed)
+    try:
+        price = get_live_price(parsed["symbol"])
+        sma200 = get_sma200(parsed["symbol"], parsed["timeframe"])
+        k_now, k_prev = get_stochastic(parsed["symbol"], parsed["timeframe"])
+
+        decision = evaluate_trade(parsed, price, sma200, k_now, k_prev)
+
+    except Exception as e:
+        decision = {"decision": "ERROR", "reason": str(e)}
+        price = sma200 = None
+
     print("⚙️ Decision:", decision)
-
-    price = None
-    if parsed and parsed["symbol"] != "UNKNOWN":
-        try:
-            price = get_live_price(parsed["symbol"])
-            print("✅ Live price:", price)
-        except Exception as e:
-            print("❌ TwelveData error:", e)
 
     return {
         "status": "ok",
         "parsed": parsed,
         "decision": decision,
-        "live_price": price
+        "live_price": price,
+        "sma200": sma200,
+        "stochastic": {
+            "k_now": k_now if 'k_now' in locals() else None,
+            "k_prev": k_prev if 'k_prev' in locals() else None
+        }
     }
