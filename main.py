@@ -7,21 +7,17 @@ from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 
 # ==================================================
-# 🔧 APP + CONFIG
+# 🔧 APP CONFIG
 # ==================================================
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
+ENGINE_VERSION = 2
 WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
 DB_FILE = "trading.db"
 START_BALANCE = 10_000.0
-
-# Paper trading params
-SL_PCT = 0.003   # 0.3%
-TP_PCT = 0.006   # 0.6%
-PIP_VALUE = 100  # XAUUSD approx
 
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
@@ -35,50 +31,44 @@ def db():
 
 def init_db():
     with db() as con:
+        # trades
         con.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            time TEXT,
             symbol TEXT,
             action TEXT,
-            lot REAL,
-            price REAL,
-            sma200 REAL,
-            confidence TEXT,
-            decision TEXT
-        )
-        """)
-
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS positions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trade_id INTEGER,
-            symbol TEXT,
-            action TEXT,
-            lot REAL,
             entry_price REAL,
-            sl REAL,
-            tp REAL,
-            entry_time TEXT,
-            status TEXT,
             exit_price REAL,
-            exit_time TEXT,
-            pnl REAL
+            lot REAL,
+            status TEXT,
+            pnl REAL,
+            time_open TEXT,
+            time_close TEXT,
+            engine_version INTEGER
         )
         """)
 
+        # balance history
         con.execute("""
         CREATE TABLE IF NOT EXISTS balance (
             time TEXT,
-            balance REAL
+            balance REAL,
+            engine_version INTEGER
         )
         """)
 
-        cur = con.execute("SELECT COUNT(*) FROM balance")
+        # RESET paper account (ENGINE v2)
+        con.execute("DELETE FROM trades WHERE engine_version < ?", (ENGINE_VERSION,))
+        con.execute("DELETE FROM balance WHERE engine_version < ?", (ENGINE_VERSION,))
+
+        cur = con.execute(
+            "SELECT COUNT(*) FROM balance WHERE engine_version = ?",
+            (ENGINE_VERSION,)
+        )
         if cur.fetchone()[0] == 0:
             con.execute(
-                "INSERT INTO balance VALUES (?, ?)",
-                (datetime.utcnow().isoformat(), START_BALANCE)
+                "INSERT INTO balance VALUES (?, ?, ?)",
+                (datetime.utcnow().isoformat(), START_BALANCE, ENGINE_VERSION)
             )
 
 init_db()
@@ -87,10 +77,8 @@ init_db()
 # 🔎 PARSER
 # ==================================================
 def parse_signal(text: str):
-    if not text:
-        return None
-
     t = text.lower()
+
     action = "buy" if "buy" in t else "sell" if "sell" in t else None
     if not action:
         return None
@@ -119,10 +107,7 @@ def parse_signal(text: str):
 def safe_request(url, params):
     try:
         r = requests.get(url, params=params, timeout=5)
-        data = r.json()
-        if isinstance(data, dict) and data.get("status") == "error":
-            return None
-        return data
+        return r.json()
     except Exception:
         return None
 
@@ -161,133 +146,78 @@ def evaluate_trade(parsed, price, sma200):
     if parsed["confidence"] != "HIGH":
         reasons.append("low_confidence")
 
-    if price is None:
-        reasons.append("no_price")
-
-    if sma200 is None:
-        reasons.append("no_sma200")
+    if price is None or sma200 is None:
+        reasons.append("no_market_data")
 
     if price and sma200:
         if parsed["action"] == "buy" and price < sma200:
-            reasons.append("price_below_sma200")
+            reasons.append("below_sma200")
         if parsed["action"] == "sell" and price > sma200:
-            reasons.append("price_above_sma200")
+            reasons.append("above_sma200")
 
-    return ("approved" if not reasons else "rejected"), reasons
+    return "approved" if not reasons else "rejected", reasons
 
 # ==================================================
 # 📊 BALANCE
 # ==================================================
 def get_balance():
     cur = db().execute(
-        "SELECT balance FROM balance ORDER BY time DESC LIMIT 1"
+        "SELECT balance FROM balance WHERE engine_version = ? ORDER BY time DESC LIMIT 1",
+        (ENGINE_VERSION,)
     )
     return cur.fetchone()[0]
 
-def update_balance(delta):
-    new_balance = get_balance() + delta
-    with db() as con:
-        con.execute(
-            "INSERT INTO balance VALUES (?, ?)",
-            (datetime.utcnow().isoformat(), new_balance)
-        )
+def update_balance(new_balance):
+    db().execute(
+        "INSERT INTO balance VALUES (?, ?, ?)",
+        (datetime.utcnow().isoformat(), new_balance, ENGINE_VERSION)
+    ).connection.commit()
 
 # ==================================================
-# 🧾 STORAGE
+# 📄 PAPER TRADING ENGINE
 # ==================================================
-def save_trade(parsed, price, sma200, decision):
-    with db() as con:
-        cur = con.execute("""
-        INSERT INTO trades
-        (time, symbol, action, lot, price, sma200, confidence, decision)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            datetime.utcnow().isoformat(),
-            parsed["symbol"],
-            parsed["action"],
-            parsed["lot"],
-            price,
-            sma200,
-            parsed["confidence"],
-            decision
-        ))
-        return cur.lastrowid
-
-def open_position(trade_id, parsed, price):
-    if parsed["action"] == "buy":
-        sl = price * (1 - SL_PCT)
-        tp = price * (1 + TP_PCT)
-    else:
-        sl = price * (1 + SL_PCT)
-        tp = price * (1 - TP_PCT)
-
+def open_trade(parsed, price):
     with db() as con:
         con.execute("""
-        INSERT INTO positions
-        (trade_id, symbol, action, lot, entry_price, sl, tp, entry_time, status, pnl)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 0)
+        INSERT INTO trades
+        (symbol, action, entry_price, lot, status, pnl, time_open, engine_version)
+        VALUES (?, ?, ?, ?, 'OPEN', 0, ?, ?)
         """, (
-            trade_id,
             parsed["symbol"],
             parsed["action"],
-            parsed["lot"],
             price,
-            sl,
-            tp,
-            datetime.utcnow().isoformat()
+            parsed["lot"],
+            datetime.utcnow().isoformat(),
+            ENGINE_VERSION
         ))
 
-# ==================================================
-# 🔁 POSITION CHECKER (SL / TP)
-# ==================================================
-def check_positions():
-    con = db()
-    positions = con.execute("""
-        SELECT id, action, lot, entry_price, sl, tp
-        FROM positions WHERE status='OPEN'
-    """).fetchall()
+def close_trade(trade_id, price):
+    with db() as con:
+        trade = con.execute(
+            "SELECT action, entry_price, lot FROM trades WHERE id = ? AND status = 'OPEN'",
+            (trade_id,)
+        ).fetchone()
 
-    price = get_price("XAUUSD")
-    if price is None:
-        return
+        if not trade:
+            return
 
-    for pid, action, lot, entry, sl, tp in positions:
-        exit_reason = None
+        action, entry_price, lot = trade
 
-        if action == "buy":
-            if price <= sl:
-                exit_reason = "SL"
-            elif price >= tp:
-                exit_reason = "TP"
-        else:
-            if price >= sl:
-                exit_reason = "SL"
-            elif price <= tp:
-                exit_reason = "TP"
+        pnl = (price - entry_price) * lot if action == "buy" else (entry_price - price) * lot
+        new_balance = get_balance() + pnl
 
-        if exit_reason:
-            pnl = (
-                (price - entry) * lot * PIP_VALUE
-                if action == "buy"
-                else (entry - price) * lot * PIP_VALUE
-            )
+        con.execute("""
+        UPDATE trades
+        SET status='CLOSED', exit_price=?, pnl=?, time_close=?
+        WHERE id=?
+        """, (
+            price,
+            pnl,
+            datetime.utcnow().isoformat(),
+            trade_id
+        ))
 
-            with con:
-                con.execute("""
-                UPDATE positions SET
-                    status='CLOSED',
-                    exit_price=?,
-                    exit_time=?,
-                    pnl=?
-                WHERE id=?
-                """, (
-                    price,
-                    datetime.utcnow().isoformat(),
-                    pnl,
-                    pid
-                ))
-
-            update_balance(pnl)
+        update_balance(new_balance)
 
 # ==================================================
 # 🌐 WEBHOOK
@@ -295,12 +225,11 @@ def check_positions():
 @app.post("/webhook")
 async def webhook(request: Request):
     if request.query_params.get("token") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid token")
+        raise HTTPException(status_code=403)
 
-    check_positions()
-
-    body = (await request.body()).decode("utf-8")
+    body = (await request.body()).decode()
     parsed = parse_signal(body)
+
     if not parsed:
         return {"status": "ignored"}
 
@@ -308,10 +237,8 @@ async def webhook(request: Request):
     sma200 = get_sma200(parsed["symbol"])
     decision, reasons = evaluate_trade(parsed, price, sma200)
 
-    trade_id = save_trade(parsed, price, sma200, decision)
-
     if decision == "approved":
-        open_position(trade_id, parsed, price)
+        open_trade(parsed, price)
 
     return {
         "status": decision,
@@ -326,37 +253,32 @@ async def webhook(request: Request):
 @app.get("/stats")
 def stats():
     con = db()
-    trades = dict(con.execute(
-        "SELECT decision, COUNT(*) FROM trades GROUP BY decision"
-    ).fetchall())
 
-    positions = dict(con.execute(
-        "SELECT status, COUNT(*) FROM positions GROUP BY status"
-    ).fetchall())
+    trades = con.execute("""
+        SELECT status, COUNT(*) 
+        FROM trades 
+        WHERE engine_version = ?
+        GROUP BY status
+    """, (ENGINE_VERSION,)).fetchall()
+
+    open_trades = con.execute("""
+        SELECT id, symbol, action, entry_price, lot, time_open
+        FROM trades
+        WHERE status='OPEN' AND engine_version = ?
+    """, (ENGINE_VERSION,)).fetchall()
 
     return {
+        "engine_version": ENGINE_VERSION,
         "balance": get_balance(),
-        "trades": trades,
-        "positions": positions
+        "trades": dict(trades),
+        "open_positions": [
+            {
+                "id": t[0],
+                "symbol": t[1],
+                "action": t[2],
+                "entry": t[3],
+                "lot": t[4],
+                "time": t[5]
+            } for t in open_trades
+        ]
     }
-
-@app.get("/positions")
-def positions():
-    cur = db().execute("""
-        SELECT id, symbol, action, lot, entry_price, sl, tp, status, pnl
-        FROM positions ORDER BY id DESC
-    """)
-    return [
-        {
-            "id": r[0],
-            "symbol": r[1],
-            "action": r[2],
-            "lot": r[3],
-            "entry": r[4],
-            "sl": r[5],
-            "tp": r[6],
-            "status": r[7],
-            "pnl": r[8],
-        }
-        for r in cur.fetchall()
-    ]
