@@ -7,29 +7,25 @@ from fastapi import FastAPI, Request, HTTPException
 
 app = FastAPI()
 
-# ==================================================
-# 🔐 ZMIENNE ŚRODOWISKOWE
-# ==================================================
 WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
-# ==================================================
-# 🔁 MAPOWANIE SYMBOLI
-# ==================================================
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
 }
 
+LOG_FILE = "trades_log.jsonl"
+
 # ==================================================
-# 🔎 PARSER SYGNAŁU
+# 🔎 PARSER
 # ==================================================
 def parse_signal(text: str):
     if not text or text == "EMPTY":
         return None
 
     t = text.lower()
-
     action = "buy" if "buy" in t else "sell" if "sell" in t else None
+
     symbol_match = re.search(r"(xauusd)", t)
     symbol = symbol_match.group(1).upper() if symbol_match else "UNKNOWN"
 
@@ -51,39 +47,36 @@ def parse_signal(text: str):
     }
 
 # ==================================================
-# 📈 LIVE PRICE
+# 📈 PRICE + SMA
 # ==================================================
 def get_live_price(symbol: str):
-    mapped = SYMBOL_MAP.get(symbol)
-    url = "https://api.twelvedata.com/price"
-    r = requests.get(url, params={"symbol": mapped, "apikey": TWELVE_API_KEY}, timeout=5)
+    r = requests.get(
+        "https://api.twelvedata.com/price",
+        params={"symbol": SYMBOL_MAP[symbol], "apikey": TWELVE_API_KEY},
+        timeout=5
+    )
     return float(r.json()["price"])
 
-# ==================================================
-# 📊 SMA200 (M15 → fallback H1)
-# ==================================================
 def get_sma200(symbol: str, interval="15min"):
-    mapped = SYMBOL_MAP.get(symbol)
-    url = "https://api.twelvedata.com/sma"
-    params = {
-        "symbol": mapped,
-        "interval": interval,
-        "time_period": 200,
-        "apikey": TWELVE_API_KEY
-    }
-    r = requests.get(url, params=params, timeout=5)
+    r = requests.get(
+        "https://api.twelvedata.com/sma",
+        params={
+            "symbol": SYMBOL_MAP[symbol],
+            "interval": interval,
+            "time_period": 200,
+            "apikey": TWELVE_API_KEY
+        },
+        timeout=5
+    )
     data = r.json()
-
     if "values" in data:
         return float(data["values"][0]["sma"])
-
     if interval == "15min":
         return get_sma200(symbol, "1h")
-
     return None
 
 # ==================================================
-# 🧠 EVALUATE TRADE
+# 🧠 EVALUATE
 # ==================================================
 def evaluate_trade(parsed, price, sma200):
     reasons = []
@@ -101,11 +94,50 @@ def evaluate_trade(parsed, price, sma200):
     return decision, reasons
 
 # ==================================================
-# 🧾 LEARNING MEMORY (LOG)
+# 🧾 LOGGING
 # ==================================================
 def log_trade(data: dict):
-    with open("trades_log.jsonl", "a") as f:
+    with open(LOG_FILE, "a") as f:
         f.write(json.dumps(data) + "\n")
+
+def load_trades():
+    if not os.path.exists(LOG_FILE):
+        return []
+    with open(LOG_FILE, "r") as f:
+        return [json.loads(line) for line in f]
+
+# ==================================================
+# 📊 STATS
+# ==================================================
+def calculate_stats(trades):
+    stats = {
+        "total": len(trades),
+        "approved": 0,
+        "rejected": 0,
+        "rejection_reasons": {},
+        "confidence": {"HIGH": 0, "NORMAL": 0},
+        "sma_relation": {
+            "buy_above": 0,
+            "buy_below": 0,
+            "sell_above": 0,
+            "sell_below": 0,
+        }
+    }
+
+    for t in trades:
+        stats[t["decision"]] += 1
+        stats["confidence"][t["confidence"]] += 1
+
+        for r in t["reasons"]:
+            stats["rejection_reasons"][r] = stats["rejection_reasons"].get(r, 0) + 1
+
+        if t["sma200"]:
+            if t["action"] == "buy":
+                stats["sma_relation"]["buy_above" if t["price"] > t["sma200"] else "buy_below"] += 1
+            if t["action"] == "sell":
+                stats["sma_relation"]["sell_above" if t["price"] > t["sma200"] else "sell_below"] += 1
+
+    return stats
 
 # ==================================================
 # 🌐 WEBHOOK
@@ -116,33 +148,30 @@ async def webhook(request: Request):
     if token != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-    body = await request.body()
-    text = body.decode("utf-8") if body else "EMPTY"
-
+    text = (await request.body()).decode("utf-8")
     parsed = parse_signal(text)
     if not parsed:
         return {"status": "ignored"}
 
     price = get_live_price(parsed["symbol"])
     sma200 = get_sma200(parsed["symbol"])
-
     decision, reasons = evaluate_trade(parsed, price, sma200)
 
-    trade_log = {
+    log_trade({
         "time": datetime.utcnow().isoformat(),
-        "symbol": parsed["symbol"],
-        "action": parsed["action"],
+        **parsed,
         "price": price,
         "sma200": sma200,
-        "confidence": parsed["confidence"],
         "decision": decision,
         "reasons": reasons
-    }
+    })
 
-    log_trade(trade_log)
+    return {"status": "ok", "decision": decision, "reasons": reasons}
 
-    return {
-        "status": "ok",
-        "decision": decision,
-        "reasons": reasons
-    }
+# ==================================================
+# 📊 STATS ENDPOINT
+# ==================================================
+@app.get("/stats")
+def stats():
+    trades = load_trades()
+    return calculate_stats(trades)
