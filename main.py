@@ -2,13 +2,22 @@ import os
 import re
 import json
 import requests
+import logging
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 
+# ==================================================
+# 🔧 APP + LOGGING
+# ==================================================
 app = FastAPI()
+
+logging.basicConfig(level=logging.WARNING)
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
+
+if not WEBHOOK_SECRET or not TWELVE_API_KEY:
+    logging.warning("Missing environment variables")
 
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
@@ -20,14 +29,19 @@ LOG_FILE = "trades_log.jsonl"
 # 🔎 PARSER
 # ==================================================
 def parse_signal(text: str):
-    if not text or text == "EMPTY":
+    if not text:
         return None
 
     t = text.lower()
+
     action = "buy" if "buy" in t else "sell" if "sell" in t else None
+    if not action:
+        return None
 
     symbol_match = re.search(r"(xauusd)", t)
-    symbol = symbol_match.group(1).upper() if symbol_match else "UNKNOWN"
+    symbol = symbol_match.group(1).upper() if symbol_match else None
+    if symbol not in SYMBOL_MAP:
+        return None
 
     size_match = re.search(r"@\s*([0-9.]+)", t)
     size = float(size_match.group(1)) if size_match else None
@@ -43,40 +57,53 @@ def parse_signal(text: str):
         "size": size,
         "timeframe": timeframe,
         "confidence": confidence,
-        "raw": text
+        "raw": text.strip()
     }
 
 # ==================================================
-# 📈 PRICE + SMA
+# 📈 MARKET DATA
 # ==================================================
+def safe_request(url, params):
+    try:
+        r = requests.get(url, params=params, timeout=5)
+        data = r.json()
+        if "status" in data and data["status"] == "error":
+            return None
+        return data
+    except Exception:
+        return None
+
 def get_live_price(symbol: str):
-    r = requests.get(
+    data = safe_request(
         "https://api.twelvedata.com/price",
-        params={"symbol": SYMBOL_MAP[symbol], "apikey": TWELVE_API_KEY},
-        timeout=5
+        {"symbol": SYMBOL_MAP[symbol], "apikey": TWELVE_API_KEY}
     )
-    return float(r.json()["price"])
+    if not data or "price" not in data:
+        return None
+    return float(data["price"])
 
 def get_sma200(symbol: str, interval="15min"):
-    r = requests.get(
+    data = safe_request(
         "https://api.twelvedata.com/sma",
-        params={
+        {
             "symbol": SYMBOL_MAP[symbol],
             "interval": interval,
             "time_period": 200,
             "apikey": TWELVE_API_KEY
-        },
-        timeout=5
+        }
     )
-    data = r.json()
-    if "values" in data:
+
+    if data and "values" in data and data["values"]:
         return float(data["values"][0]["sma"])
+
+    # 🔁 fallback M15 → H1
     if interval == "15min":
         return get_sma200(symbol, "1h")
+
     return None
 
 # ==================================================
-# 🧠 EVALUATE
+# 🧠 EVALUATION
 # ==================================================
 def evaluate_trade(parsed, price, sma200):
     reasons = []
@@ -84,7 +111,13 @@ def evaluate_trade(parsed, price, sma200):
     if parsed["confidence"] != "HIGH":
         reasons.append("low_confidence")
 
-    if sma200:
+    if price is None:
+        reasons.append("no_price")
+
+    if sma200 is None:
+        reasons.append("no_sma200")
+
+    if price and sma200:
         if parsed["action"] == "buy" and price < sma200:
             reasons.append("price_below_sma200")
         if parsed["action"] == "sell" and price > sma200:
@@ -94,17 +127,20 @@ def evaluate_trade(parsed, price, sma200):
     return decision, reasons
 
 # ==================================================
-# 🧾 LOGGING
+# 🧾 STORAGE
 # ==================================================
 def log_trade(data: dict):
-    with open(LOG_FILE, "a") as f:
-        f.write(json.dumps(data) + "\n")
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(json.dumps(data) + "\n")
+    except Exception:
+        logging.warning("Failed to write trade log")
 
 def load_trades():
     if not os.path.exists(LOG_FILE):
         return []
     with open(LOG_FILE, "r") as f:
-        return [json.loads(line) for line in f]
+        return [json.loads(line) for line in f if line.strip()]
 
 # ==================================================
 # 📊 STATS
@@ -116,12 +152,6 @@ def calculate_stats(trades):
         "rejected": 0,
         "rejection_reasons": {},
         "confidence": {"HIGH": 0, "NORMAL": 0},
-        "sma_relation": {
-            "buy_above": 0,
-            "buy_below": 0,
-            "sell_above": 0,
-            "sell_below": 0,
-        }
     }
 
     for t in trades:
@@ -130,12 +160,6 @@ def calculate_stats(trades):
 
         for r in t["reasons"]:
             stats["rejection_reasons"][r] = stats["rejection_reasons"].get(r, 0) + 1
-
-        if t["sma200"]:
-            if t["action"] == "buy":
-                stats["sma_relation"]["buy_above" if t["price"] > t["sma200"] else "buy_below"] += 1
-            if t["action"] == "sell":
-                stats["sma_relation"]["sell_above" if t["price"] > t["sma200"] else "sell_below"] += 1
 
     return stats
 
@@ -148,8 +172,9 @@ async def webhook(request: Request):
     if token != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Invalid token")
 
-    text = (await request.body()).decode("utf-8")
-    parsed = parse_signal(text)
+    body = (await request.body()).decode("utf-8").strip()
+    parsed = parse_signal(body)
+
     if not parsed:
         return {"status": "ignored"}
 
@@ -166,12 +191,17 @@ async def webhook(request: Request):
         "reasons": reasons
     })
 
-    return {"status": "ok", "decision": decision, "reasons": reasons}
+    return {
+        "status": "ok",
+        "decision": decision,
+        "reasons": reasons,
+        "price": price,
+        "sma200": sma200
+    }
 
 # ==================================================
 # 📊 STATS ENDPOINT
 # ==================================================
 @app.get("/stats")
 def stats():
-    trades = load_trades()
-    return calculate_stats(trades)
+    return calculate_stats(load_trades())
