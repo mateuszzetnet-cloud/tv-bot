@@ -7,17 +7,20 @@ from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 
 # ==================================================
-# 🔧 APP CONFIG
+# 🔧 APP
 # ==================================================
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
-ENGINE_VERSION = 2
 WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
 DB_FILE = "trading.db"
 START_BALANCE = 10_000.0
+
+TP_POINTS = 20
+SL_POINTS = 10
+POINT_VALUE = 1.0  # $ per point per 1 lot
 
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
@@ -31,7 +34,6 @@ def db():
 
 def init_db():
     with db() as con:
-        # trades
         con.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,32 +45,22 @@ def init_db():
             status TEXT,
             pnl REAL,
             time_open TEXT,
-            time_close TEXT,
-            engine_version INTEGER
+            time_close TEXT
         )
         """)
 
-        # balance history
         con.execute("""
         CREATE TABLE IF NOT EXISTS balance (
             time TEXT,
-            balance REAL,
-            engine_version INTEGER
+            balance REAL
         )
         """)
 
-        # RESET paper account (ENGINE v2)
-        con.execute("DELETE FROM trades WHERE engine_version < ?", (ENGINE_VERSION,))
-        con.execute("DELETE FROM balance WHERE engine_version < ?", (ENGINE_VERSION,))
-
-        cur = con.execute(
-            "SELECT COUNT(*) FROM balance WHERE engine_version = ?",
-            (ENGINE_VERSION,)
-        )
+        cur = con.execute("SELECT COUNT(*) FROM balance")
         if cur.fetchone()[0] == 0:
             con.execute(
-                "INSERT INTO balance VALUES (?, ?, ?)",
-                (datetime.utcnow().isoformat(), START_BALANCE, ENGINE_VERSION)
+                "INSERT INTO balance VALUES (?, ?)",
+                (datetime.utcnow().isoformat(), START_BALANCE)
             )
 
 init_db()
@@ -128,13 +120,10 @@ def get_sma200(symbol, interval="15min"):
             "apikey": TWELVE_API_KEY
         }
     )
-
-    if data and "values" in data and data["values"]:
+    if data and "values" in data:
         return float(data["values"][0]["sma"])
-
     if interval == "15min":
         return get_sma200(symbol, "1h")
-
     return None
 
 # ==================================================
@@ -161,16 +150,14 @@ def evaluate_trade(parsed, price, sma200):
 # 📊 BALANCE
 # ==================================================
 def get_balance():
-    cur = db().execute(
-        "SELECT balance FROM balance WHERE engine_version = ? ORDER BY time DESC LIMIT 1",
-        (ENGINE_VERSION,)
-    )
+    cur = db().execute("SELECT balance FROM balance ORDER BY time DESC LIMIT 1")
     return cur.fetchone()[0]
 
-def update_balance(new_balance):
+def update_balance(delta):
+    new_balance = get_balance() + delta
     db().execute(
-        "INSERT INTO balance VALUES (?, ?, ?)",
-        (datetime.utcnow().isoformat(), new_balance, ENGINE_VERSION)
+        "INSERT INTO balance VALUES (?, ?)",
+        (datetime.utcnow().isoformat(), new_balance)
     ).connection.commit()
 
 # ==================================================
@@ -180,44 +167,57 @@ def open_trade(parsed, price):
     with db() as con:
         con.execute("""
         INSERT INTO trades
-        (symbol, action, entry_price, lot, status, pnl, time_open, engine_version)
-        VALUES (?, ?, ?, ?, 'OPEN', 0, ?, ?)
+        (symbol, action, entry_price, lot, status, pnl, time_open)
+        VALUES (?, ?, ?, ?, 'OPEN', 0, ?)
         """, (
             parsed["symbol"],
             parsed["action"],
             price,
             parsed["lot"],
-            datetime.utcnow().isoformat(),
-            ENGINE_VERSION
+            datetime.utcnow().isoformat()
         ))
 
-def close_trade(trade_id, price):
+def close_trade(trade_id, exit_price, pnl):
     with db() as con:
-        trade = con.execute(
-            "SELECT action, entry_price, lot FROM trades WHERE id = ? AND status = 'OPEN'",
-            (trade_id,)
-        ).fetchone()
-
-        if not trade:
-            return
-
-        action, entry_price, lot = trade
-
-        pnl = (price - entry_price) * lot if action == "buy" else (entry_price - price) * lot
-        new_balance = get_balance() + pnl
-
         con.execute("""
         UPDATE trades
-        SET status='CLOSED', exit_price=?, pnl=?, time_close=?
+        SET status='CLOSED',
+            exit_price=?,
+            pnl=?,
+            time_close=?
         WHERE id=?
         """, (
-            price,
+            exit_price,
             pnl,
             datetime.utcnow().isoformat(),
             trade_id
         ))
+    update_balance(pnl)
 
-        update_balance(new_balance)
+def manage_open_trades(symbol, current_price, new_signal_action=None):
+    cur = db().execute("""
+        SELECT id, action, entry_price, lot
+        FROM trades
+        WHERE status='OPEN' AND symbol=?
+    """, (symbol,))
+
+    for trade_id, action, entry, lot in cur.fetchall():
+        direction = 1 if action == "buy" else -1
+        diff = (current_price - entry) * direction
+
+        # TP / SL
+        if diff >= TP_POINTS:
+            pnl = TP_POINTS * lot * POINT_VALUE
+            close_trade(trade_id, current_price, pnl)
+
+        elif diff <= -SL_POINTS:
+            pnl = -SL_POINTS * lot * POINT_VALUE
+            close_trade(trade_id, current_price, pnl)
+
+        # Opposite signal
+        elif new_signal_action and new_signal_action != action:
+            pnl = diff * lot * POINT_VALUE
+            close_trade(trade_id, current_price, pnl)
 
 # ==================================================
 # 🌐 WEBHOOK
@@ -229,13 +229,15 @@ async def webhook(request: Request):
 
     body = (await request.body()).decode()
     parsed = parse_signal(body)
-
     if not parsed:
         return {"status": "ignored"}
 
     price = get_price(parsed["symbol"])
     sma200 = get_sma200(parsed["symbol"])
     decision, reasons = evaluate_trade(parsed, price, sma200)
+
+    if price:
+        manage_open_trades(parsed["symbol"], price, parsed["action"])
 
     if decision == "approved":
         open_trade(parsed, price)
@@ -244,7 +246,8 @@ async def webhook(request: Request):
         "status": decision,
         "price": price,
         "sma200": sma200,
-        "reasons": reasons
+        "reasons": reasons,
+        "balance": get_balance()
     }
 
 # ==================================================
@@ -252,33 +255,14 @@ async def webhook(request: Request):
 # ==================================================
 @app.get("/stats")
 def stats():
-    con = db()
+    cur = db().execute("SELECT status, COUNT(*) FROM trades GROUP BY status")
+    trades = dict(cur.fetchall())
 
-    trades = con.execute("""
-        SELECT status, COUNT(*) 
-        FROM trades 
-        WHERE engine_version = ?
-        GROUP BY status
-    """, (ENGINE_VERSION,)).fetchall()
-
-    open_trades = con.execute("""
-        SELECT id, symbol, action, entry_price, lot, time_open
-        FROM trades
-        WHERE status='OPEN' AND engine_version = ?
-    """, (ENGINE_VERSION,)).fetchall()
+    cur = db().execute("SELECT SUM(pnl) FROM trades WHERE status='CLOSED'")
+    total_pnl = cur.fetchone()[0] or 0
 
     return {
-        "engine_version": ENGINE_VERSION,
         "balance": get_balance(),
-        "trades": dict(trades),
-        "open_positions": [
-            {
-                "id": t[0],
-                "symbol": t[1],
-                "action": t[2],
-                "entry": t[3],
-                "lot": t[4],
-                "time": t[5]
-            } for t in open_trades
-        ]
+        "total_pnl": total_pnl,
+        "trades": trades
     }
