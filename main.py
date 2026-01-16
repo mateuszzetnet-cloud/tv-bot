@@ -18,23 +18,22 @@ TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 DB_FILE = "trading.db"
 START_BALANCE = 10_000.0
 
-# === RISK ===
+# === GLOBAL RISK ===
 RISK_PER_TRADE = 0.01
 MAX_DAILY_LOSS = 0.03
 MAX_DRAWDOWN = 0.10
 
-TP_POINTS = 20
-SL_POINTS = 10
+# === DEFAULT TP / SL (fallback) ===
+DEFAULT_TP = 20
+DEFAULT_SL = 10
 POINT_VALUE = 1.0
 
-# === ADAPTIVE ENGINE ===
 AUTO_REGISTER_ENABLED = 1
-MAX_TRADES_PER_DAY = 5
-MIN_TRADES_FOR_EVAL = 10
-MIN_WINRATE = 0.45
-COOLDOWN_DAYS = 2
+MIN_TRADES_FOR_OPT = 20
+OPT_LOOKBACK = 50
+TP_RANGE = (10, 60)
+SL_RANGE = (5, 30)
 
-# === SYMBOL MAP (FX + METALS + CRYPTO) ===
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
     "XAGUSD": "XAG/USD",
@@ -86,27 +85,17 @@ def init_db():
         CREATE TABLE IF NOT EXISTS symbols (
             symbol TEXT PRIMARY KEY,
             enabled INTEGER,
-            total_trades INTEGER,
-            wins INTEGER,
-            losses INTEGER,
-            winrate REAL,
-            cooldown_until TEXT,
-            created_at TEXT,
-            last_trade_at TEXT
+            created_at TEXT
         )
         """)
 
-        # === FEATURE STORE (STEP 16) ===
+        # === TP / SL PER SYMBOL (ETAP 17) ===
         con.execute("""
-        CREATE TABLE IF NOT EXISTS features (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            action TEXT,
-            price REAL,
-            sma200 REAL,
-            distance REAL,
-            pnl REAL,
-            timestamp TEXT
+        CREATE TABLE IF NOT EXISTS symbol_params (
+            symbol TEXT PRIMARY KEY,
+            tp INTEGER,
+            sl INTEGER,
+            last_update TEXT
         )
         """)
 
@@ -116,20 +105,10 @@ def init_db():
                 (datetime.utcnow().isoformat(), START_BALANCE)
             )
 
-        defaults = {
-            "engine_status": "ACTIVE",
-            "peak_balance": str(START_BALANCE),
-            "daily_date": str(date.today()),
-            "daily_pnl": "0"
-        }
-
-        for k, v in defaults.items():
-            con.execute("INSERT OR IGNORE INTO engine_state VALUES (?, ?)", (k, v))
-
 init_db()
 
 # ==================================================
-# 🔎 PARSER (MULTI SYMBOL)
+# 🔎 PARSER
 # ==================================================
 def parse_signal(text: str):
     t = text.lower()
@@ -137,46 +116,26 @@ def parse_signal(text: str):
     if not action:
         return None
 
-    symbol = None
     for s in SYMBOL_MAP:
         if s.lower() in t:
-            symbol = s
-            break
-
-    if not symbol:
-        return None
-
-    return {"symbol": symbol, "action": action}
+            return {"symbol": s, "action": action}
+    return None
 
 # ==================================================
-# 🧠 SYMBOL ENGINE
+# 🧠 SYMBOL REGISTRATION
 # ==================================================
 def register_symbol(symbol):
     if not AUTO_REGISTER_ENABLED:
         return
     with db() as con:
-        con.execute("""
-            INSERT OR IGNORE INTO symbols
-            VALUES (?, 1, 0, 0, 0, 0, NULL, ?, NULL)
-        """, (symbol, datetime.utcnow().isoformat()))
-
-def symbol_allowed(symbol):
-    row = db().execute("""
-        SELECT enabled, cooldown_until FROM symbols WHERE symbol=?
-    """, (symbol,)).fetchone()
-
-    if not row:
-        return False
-
-    enabled, cooldown = row
-
-    if cooldown and datetime.utcnow() >= datetime.fromisoformat(cooldown):
-        db().execute("""
-            UPDATE symbols SET enabled=1, cooldown_until=NULL WHERE symbol=?
-        """, (symbol,)).connection.commit()
-        enabled = 1
-
-    return bool(enabled)
+        con.execute(
+            "INSERT OR IGNORE INTO symbols VALUES (?, 1, ?)",
+            (symbol, datetime.utcnow().isoformat())
+        )
+        con.execute(
+            "INSERT OR IGNORE INTO symbol_params VALUES (?, ?, ?, ?)",
+            (symbol, DEFAULT_TP, DEFAULT_SL, datetime.utcnow().isoformat())
+        )
 
 # ==================================================
 # 📈 MARKET DATA
@@ -204,37 +163,83 @@ def get_sma200(symbol):
     return float(d["values"][0]["sma"]) if d and "values" in d else None
 
 # ==================================================
-# 💰 BALANCE
+# 💰 RISK / LOT
 # ==================================================
 def get_balance():
     return db().execute(
         "SELECT balance FROM balance ORDER BY time DESC LIMIT 1"
     ).fetchone()[0]
 
-def update_balance(delta):
-    bal = get_balance() + delta
+def calculate_lot(sl_points):
+    risk = get_balance() * RISK_PER_TRADE
+    return round(max(risk / (sl_points * POINT_VALUE), 0.01), 2)
+
+# ==================================================
+# 🧠 TP / SL OPTIMIZATION (ETAP 17)
+# ==================================================
+def optimize_symbol(symbol):
+    rows = db().execute("""
+        SELECT pnl FROM trades
+        WHERE symbol=? AND status='CLOSED'
+        ORDER BY time_close DESC
+        LIMIT ?
+    """, (symbol, OPT_LOOKBACK)).fetchall()
+
+    if len(rows) < MIN_TRADES_FOR_OPT:
+        return
+
+    wins = [r[0] for r in rows if r[0] > 0]
+    losses = [abs(r[0]) for r in rows if r[0] < 0]
+
+    winrate = len(wins) / len(rows)
+    avg_win = sum(wins) / len(wins) if wins else DEFAULT_TP
+    avg_loss = sum(losses) / len(losses) if losses else DEFAULT_SL
+
+    tp = int(min(max(avg_win, TP_RANGE[0]), TP_RANGE[1]))
+    sl = int(min(max(avg_loss, SL_RANGE[0]), SL_RANGE[1]))
+
+    db().execute("""
+        UPDATE symbol_params
+        SET tp=?, sl=?, last_update=?
+        WHERE symbol=?
+    """, (tp, sl, datetime.utcnow().isoformat(), symbol)).connection.commit()
+
+# ==================================================
+# 📦 TRADE EXECUTION
+# ==================================================
+def execute_trade(symbol, action, price, sma):
+    row = db().execute(
+        "SELECT tp, sl FROM symbol_params WHERE symbol=?",
+        (symbol,)
+    ).fetchone()
+
+    tp, sl = row if row else (DEFAULT_TP, DEFAULT_SL)
+    lot = calculate_lot(sl)
+
+    if action == "buy":
+        pnl = tp * lot if price > sma else -sl * lot
+    else:
+        pnl = tp * lot if price < sma else -sl * lot
+
     db().execute(
-        "INSERT INTO balance VALUES (?, ?)",
-        (datetime.utcnow().isoformat(), bal)
+        "INSERT INTO trades VALUES (NULL, ?, ?, ?, ?, ?, 'CLOSED', ?, ?, ?)",
+        (
+            symbol, action,
+            price, price,
+            lot, pnl,
+            datetime.utcnow().isoformat(),
+            datetime.utcnow().isoformat()
+        )
     ).connection.commit()
 
-# ==================================================
-# 📦 TRADES + FEATURE STORE
-# ==================================================
-def calculate_lot():
-    return round(max((get_balance() * RISK_PER_TRADE) / SL_POINTS, 0.01), 2)
+    db().execute(
+        "INSERT INTO balance VALUES (?, ?)",
+        (datetime.utcnow().isoformat(), get_balance() + pnl)
+    ).connection.commit()
 
-def store_features(symbol, action, price, sma, pnl):
-    db().execute("""
-        INSERT INTO features
-        (symbol, action, price, sma200, distance, pnl, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        symbol, action, price, sma,
-        price - sma if sma else 0,
-        pnl,
-        datetime.utcnow().isoformat()
-    )).connection.commit()
+    optimize_symbol(symbol)
+
+    return pnl
 
 # ==================================================
 # 🌐 WEBHOOK
@@ -250,24 +255,12 @@ async def webhook(request: Request):
 
     register_symbol(parsed["symbol"])
 
-    if not symbol_allowed(parsed["symbol"]):
-        return {"status": "symbol_blocked"}
-
     price = get_price(parsed["symbol"])
     sma = get_sma200(parsed["symbol"])
-
     if not price or not sma:
         return {"status": "no_data"}
 
-    if parsed["action"] == "buy" and price > sma:
-        pnl = TP_POINTS * calculate_lot()
-    elif parsed["action"] == "sell" and price < sma:
-        pnl = TP_POINTS * calculate_lot()
-    else:
-        pnl = -SL_POINTS * calculate_lot()
-
-    update_balance(pnl)
-    store_features(parsed["symbol"], parsed["action"], price, sma, pnl)
+    pnl = execute_trade(parsed["symbol"], parsed["action"], price, sma)
 
     return {
         "status": "executed",
@@ -284,6 +277,6 @@ def stats():
     return {
         "balance": get_balance(),
         "symbols": list(db().execute(
-            "SELECT symbol, enabled, total_trades, winrate FROM symbols"
+            "SELECT symbol, tp, sl FROM symbol_params"
         ))
     }
