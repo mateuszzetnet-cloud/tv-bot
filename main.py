@@ -2,7 +2,7 @@ import os
 import sqlite3
 import requests
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from fastapi import FastAPI, Request, HTTPException
 
 # ==================================================
@@ -26,7 +26,7 @@ TP_POINTS = 20
 SL_POINTS = 10
 POINT_VALUE = 1.0
 
-# === ETAP 15 – ADAPTATION ===
+# === ADAPTATION ===
 AUTO_REGISTER_ENABLED = 1
 MAX_TRADES_PER_DAY = 5
 MIN_TRADES_FOR_EVAL = 10
@@ -74,6 +74,21 @@ def init_db():
         )
         """)
 
+        # 🧠 SYMBOLS TABLE
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS symbols (
+            symbol TEXT PRIMARY KEY,
+            enabled INTEGER,
+            total_trades INTEGER,
+            wins INTEGER,
+            losses INTEGER,
+            winrate REAL,
+            cooldown_until TEXT,
+            created_at TEXT,
+            last_trade_at TEXT
+        )
+        """)
+
         if con.execute("SELECT COUNT(*) FROM balance").fetchone()[0] == 0:
             con.execute(
                 "INSERT INTO balance VALUES (?, ?)",
@@ -110,58 +125,100 @@ def parse_signal(text: str):
 
     confidence = "HIGH" if "high" in t else "NORMAL"
 
-    return {
-        "symbol": symbol,
-        "action": action,
-        "confidence": confidence
-    }
+    return {"symbol": symbol, "action": action, "confidence": confidence}
+
+# ==================================================
+# 🧠 SYMBOL ENGINE
+# ==================================================
+def register_symbol(symbol):
+    if not AUTO_REGISTER_ENABLED:
+        return
+
+    with db() as con:
+        con.execute("""
+            INSERT OR IGNORE INTO symbols
+            VALUES (?, 1, 0, 0, 0, 0, NULL, ?, NULL)
+        """, (symbol, datetime.utcnow().isoformat()))
+
+def symbol_allowed(symbol):
+    row = db().execute("""
+        SELECT enabled, cooldown_until FROM symbols WHERE symbol=?
+    """, (symbol,)).fetchone()
+
+    if not row:
+        return False
+
+    enabled, cooldown = row
+    if not enabled:
+        return False
+
+    if cooldown:
+        if datetime.utcnow() < datetime.fromisoformat(cooldown):
+            return False
+
+    return True
+
+def update_symbol_after_trade(symbol, pnl):
+    with db() as con:
+        row = con.execute("""
+            SELECT total_trades, wins, losses FROM symbols WHERE symbol=?
+        """, (symbol,)).fetchone()
+
+        if not row:
+            return
+
+        total, wins, losses = row
+        total += 1
+
+        if pnl > 0:
+            wins += 1
+        else:
+            losses += 1
+
+        winrate = wins / total if total else 0
+
+        cooldown = None
+        enabled = 1
+
+        if total >= MIN_TRADES_FOR_EVAL and winrate < MIN_WINRATE:
+            enabled = 0
+            cooldown = (datetime.utcnow() + timedelta(days=COOLDOWN_DAYS)).isoformat()
+            logging.warning(f"[AUTO] {symbol} disabled (winrate={winrate:.2f})")
+
+        con.execute("""
+            UPDATE symbols
+            SET total_trades=?, wins=?, losses=?, winrate=?,
+                enabled=?, cooldown_until=?, last_trade_at=?
+            WHERE symbol=?
+        """, (
+            total, wins, losses, winrate,
+            enabled, cooldown, datetime.utcnow().isoformat(), symbol
+        ))
 
 # ==================================================
 # 📈 MARKET DATA
 # ==================================================
 def safe_request(url, params):
     try:
-        r = requests.get(url, params=params, timeout=5)
-        return r.json()
+        return requests.get(url, params=params, timeout=5).json()
     except Exception:
         return None
 
 def get_price(symbol):
-    d = safe_request(
-        "https://api.twelvedata.com/price",
-        {"symbol": SYMBOL_MAP[symbol], "apikey": TWELVE_API_KEY}
-    )
+    d = safe_request("https://api.twelvedata.com/price", {
+        "symbol": SYMBOL_MAP[symbol],
+        "apikey": TWELVE_API_KEY
+    })
     return float(d["price"]) if d and "price" in d else None
 
-def get_sma200(symbol, interval="15min"):
-    d = safe_request(
-        "https://api.twelvedata.com/sma",
-        {
-            "symbol": SYMBOL_MAP[symbol],
-            "interval": interval,
-            "time_period": 200,
-            "apikey": TWELVE_API_KEY
-        }
-    )
-    if d and "values" in d:
-        return float(d["values"][0]["sma"])
-    if interval == "15min":
-        return get_sma200(symbol, "1h")
-    return None
-
-# ==================================================
-# 📊 ENGINE STATE
-# ==================================================
-def get_state(key):
-    return db().execute(
-        "SELECT value FROM engine_state WHERE key=?", (key,)
-    ).fetchone()[0]
-
-def set_state(key, value):
-    db().execute(
-        "UPDATE engine_state SET value=? WHERE key=?",
-        (str(value), key)
-    ).connection.commit()
+def get_sma200(symbol):
+    d = safe_request("https://api.twelvedata.com/sma", {
+        "symbol": SYMBOL_MAP[symbol],
+        "interval": "15min",
+        "time_period": 200,
+        "apikey": TWELVE_API_KEY
+    })
+    return float(d["values"][0]["sma"]) if d and "values" in d else None
 
 # ==================================================
 # 💰 BALANCE
@@ -178,35 +235,12 @@ def update_balance(delta):
         (datetime.utcnow().isoformat(), bal)
     ).connection.commit()
 
-    peak = float(get_state("peak_balance"))
-    if bal > peak:
-        set_state("peak_balance", bal)
-
 # ==================================================
-# 📦 POSITION SIZE
+# 📦 TRADES
 # ==================================================
 def calculate_lot():
-    bal = get_balance()
-    risk = bal * RISK_PER_TRADE
-    return round(max(risk / (SL_POINTS * POINT_VALUE), 0.01), 2)
+    return round(max((get_balance() * RISK_PER_TRADE) / SL_POINTS, 0.01), 2)
 
-# ==================================================
-# 🧠 STRATEGY
-# ==================================================
-def evaluate_trade(parsed, price, sma):
-    if parsed["confidence"] != "HIGH":
-        return False
-    if price is None or sma is None:
-        return False
-    if parsed["action"] == "buy" and price < sma:
-        return False
-    if parsed["action"] == "sell" and price > sma:
-        return False
-    return True
-
-# ==================================================
-# 📄 TRADES
-# ==================================================
 def open_trade(parsed, price):
     db().execute("""
         INSERT INTO trades
@@ -220,85 +254,15 @@ def open_trade(parsed, price):
         datetime.utcnow().isoformat()
     )).connection.commit()
 
-def close_trade(tid, pnl, price):
+def close_trade(tid, symbol, pnl, price):
     db().execute("""
         UPDATE trades
         SET status='CLOSED', exit_price=?, pnl=?, time_close=?
         WHERE id=?
-    """, (
-        price,
-        pnl,
-        datetime.utcnow().isoformat(),
-        tid
-    )).connection.commit()
+    """, (price, pnl, datetime.utcnow().isoformat(), tid)).connection.commit()
 
     update_balance(pnl)
-    set_state("daily_pnl", float(get_state("daily_pnl")) + pnl)
-
-# ==================================================
-# 🔁 TRADE MANAGEMENT
-# ==================================================
-def manage_trades(symbol, price, new_action):
-    cur = db().execute("""
-        SELECT id, action, entry_price, lot
-        FROM trades WHERE status='OPEN' AND symbol=?
-    """, (symbol,))
-
-    for tid, action, entry, lot in cur.fetchall():
-        dir = 1 if action == "buy" else -1
-        diff = (price - entry) * dir
-
-        if diff >= TP_POINTS:
-            close_trade(tid, TP_POINTS * lot, price)
-        elif diff <= -SL_POINTS:
-            close_trade(tid, -SL_POINTS * lot, price)
-        elif new_action != action:
-            close_trade(tid, diff * lot, price)
-
-# ==================================================
-# 🧠 ETAP 15 – ADAPTATION
-# ==================================================
-def trades_today(symbol):
-    return db().execute("""
-        SELECT COUNT(*) FROM trades
-        WHERE symbol=? AND date(time_open)=date('now')
-    """, (symbol,)).fetchone()[0]
-
-def symbol_stats(symbol):
-    cur = db().execute("""
-        SELECT COUNT(*), SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END)
-        FROM trades WHERE symbol=? AND status='CLOSED'
-    """, (symbol,))
-    total, wins = cur.fetchone()
-    wins = wins or 0
-    return total, wins / total if total else 0
-
-def auto_disable_check(symbol):
-    total, winrate = symbol_stats(symbol)
-    if total >= MIN_TRADES_FOR_EVAL and winrate < MIN_WINRATE:
-        logging.warning(f"[AUTO] {symbol} disabled (winrate={winrate:.2f})")
-
-# ==================================================
-# 🚦 RISK LOCKS
-# ==================================================
-def check_risk_locks():
-    today = str(date.today())
-    if get_state("daily_date") != today:
-        set_state("daily_date", today)
-        set_state("daily_pnl", 0)
-        set_state("engine_status", "ACTIVE")
-
-    bal = get_balance()
-    peak = float(get_state("peak_balance"))
-    daily_pnl = float(get_state("daily_pnl"))
-
-    if daily_pnl <= -bal * MAX_DAILY_LOSS:
-        set_state("engine_status", "DAILY_LOCK")
-
-    if (peak - bal) / peak >= MAX_DRAWDOWN:
-        set_state("engine_status", "DD_LOCK")
-
-    return get_state("engine_status")
+    update_symbol_after_trade(symbol, pnl)
 
 # ==================================================
 # 🌐 WEBHOOK
@@ -312,22 +276,22 @@ async def webhook(request: Request):
     if not parsed:
         return {"status": "ignored"}
 
-    if trades_today(parsed["symbol"]) >= MAX_TRADES_PER_DAY:
-        return {"status": "cooldown"}
+    register_symbol(parsed["symbol"])
+
+    if not symbol_allowed(parsed["symbol"]):
+        return {"status": "symbol_blocked"}
 
     price = get_price(parsed["symbol"])
     sma = get_sma200(parsed["symbol"])
 
-    manage_trades(parsed["symbol"], price, parsed["action"])
+    if price and sma:
+        if parsed["action"] == "buy" and price > sma:
+            open_trade(parsed, price)
+            return {"status": "opened"}
+        if parsed["action"] == "sell" and price < sma:
+            open_trade(parsed, price)
+            return {"status": "opened"}
 
-    if check_risk_locks() != "ACTIVE":
-        return {"status": "blocked"}
-
-    if evaluate_trade(parsed, price, sma):
-        open_trade(parsed, price)
-        return {"status": "opened"}
-
-    auto_disable_check(parsed["symbol"])
     return {"status": "rejected"}
 
 # ==================================================
@@ -337,7 +301,5 @@ async def webhook(request: Request):
 def stats():
     return {
         "balance": get_balance(),
-        "engine_status": get_state("engine_status"),
-        "daily_pnl": float(get_state("daily_pnl")),
-        "peak_balance": float(get_state("peak_balance")),
+        "symbols": list(db().execute("SELECT symbol, enabled, winrate FROM symbols"))
     }
