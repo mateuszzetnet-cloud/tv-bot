@@ -74,7 +74,6 @@ def init_db():
         )
         """)
 
-        # 🧠 SYMBOLS TABLE
         con.execute("""
         CREATE TABLE IF NOT EXISTS symbols (
             symbol TEXT PRIMARY KEY,
@@ -123,9 +122,7 @@ def parse_signal(text: str):
     if symbol not in SYMBOL_MAP:
         return None
 
-    confidence = "HIGH" if "high" in t else "NORMAL"
-
-    return {"symbol": symbol, "action": action, "confidence": confidence}
+    return {"symbol": symbol, "action": action}
 
 # ==================================================
 # 🧠 SYMBOL ENGINE
@@ -142,43 +139,50 @@ def register_symbol(symbol):
 
 def symbol_allowed(symbol):
     row = db().execute("""
-        SELECT enabled, cooldown_until FROM symbols WHERE symbol=?
+        SELECT enabled, cooldown_until, last_trade_at FROM symbols WHERE symbol=?
     """, (symbol,)).fetchone()
 
     if not row:
         return False
 
-    enabled, cooldown = row
+    enabled, cooldown, last_trade = row
+
+    # auto re-enable after cooldown
+    if cooldown and datetime.utcnow() >= datetime.fromisoformat(cooldown):
+        db().execute("""
+            UPDATE symbols SET enabled=1, cooldown_until=NULL WHERE symbol=?
+        """, (symbol,)).connection.commit()
+        enabled = 1
+
     if not enabled:
         return False
 
-    if cooldown:
-        if datetime.utcnow() < datetime.fromisoformat(cooldown):
-            return False
+    # daily trade limit
+    if last_trade:
+        if datetime.fromisoformat(last_trade).date() == date.today():
+            cnt = db().execute("""
+                SELECT COUNT(*) FROM trades
+                WHERE symbol=? AND DATE(time_open)=?
+            """, (symbol, date.today().isoformat())).fetchone()[0]
+
+            if cnt >= MAX_TRADES_PER_DAY:
+                return False
 
     return True
 
 def update_symbol_after_trade(symbol, pnl):
     with db() as con:
-        row = con.execute("""
+        total, wins, losses = con.execute("""
             SELECT total_trades, wins, losses FROM symbols WHERE symbol=?
         """, (symbol,)).fetchone()
 
-        if not row:
-            return
-
-        total, wins, losses = row
         total += 1
+        wins += 1 if pnl > 0 else 0
+        losses += 1 if pnl <= 0 else 0
 
-        if pnl > 0:
-            wins += 1
-        else:
-            losses += 1
-
-        winrate = wins / total if total else 0
-
-        cooldown = None
+        winrate = wins / total
         enabled = 1
+        cooldown = None
 
         if total >= MIN_TRADES_FOR_EVAL and winrate < MIN_WINRATE:
             enabled = 0
@@ -301,5 +305,11 @@ async def webhook(request: Request):
 def stats():
     return {
         "balance": get_balance(),
-        "symbols": list(db().execute("SELECT symbol, enabled, winrate FROM symbols"))
+        "symbols": [
+            dict(row) for row in db().execute("""
+                SELECT symbol, enabled, total_trades, winrate,
+                       cooldown_until, last_trade_at
+                FROM symbols
+            """)
+        ]
     }
