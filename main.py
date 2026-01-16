@@ -46,6 +46,8 @@ def init_db():
             symbol TEXT,
             action TEXT,
             entry_price REAL,
+            tp REAL,
+            sl REAL,
             exit_price REAL,
             lot REAL,
             status TEXT,
@@ -195,7 +197,7 @@ def performance_stats(symbol):
     }
 
 # ==================================================
-# 🧠 LIVE GATE (ETAP 20)
+# 🧠 LIVE GATE
 # ==================================================
 def check_live_ready(symbol):
     s = performance_stats(symbol)
@@ -210,7 +212,7 @@ def check_live_ready(symbol):
     )
 
 # ==================================================
-# 🛑 RISK GUARD (ETAP 21)
+# 🛑 RISK GUARD
 # ==================================================
 def risk_guard():
     today = str(date.today())
@@ -232,28 +234,71 @@ def risk_guard():
     return True
 
 # ==================================================
-# 📄 PAPER TRADE
+# 🔁 CHECK OPEN TRADES
+# ==================================================
+def check_open_trades(symbol, price):
+    trades = db().execute("""
+        SELECT id, action, entry_price, tp, sl, lot
+        FROM trades
+        WHERE symbol=? AND status='OPEN'
+    """, (symbol,)).fetchall()
+
+    for t in trades:
+        trade_id, action, entry, tp, sl, lot = t
+
+        hit_tp = price >= tp if action == "buy" else price <= tp
+        hit_sl = price <= sl if action == "buy" else price >= sl
+
+        if hit_tp or hit_sl:
+            exit_price = tp if hit_tp else sl
+            pnl = (exit_price - entry) * lot * POINT_VALUE
+            if action == "sell":
+                pnl *= -1
+
+            db().execute("""
+                UPDATE trades
+                SET status='CLOSED',
+                    exit_price=?,
+                    pnl=?,
+                    time_close=?
+                WHERE id=?
+            """, (
+                exit_price,
+                pnl,
+                datetime.utcnow().isoformat(),
+                trade_id
+            )).connection.commit()
+
+            update_balance(pnl)
+            daily = float(get_state("daily_pnl")) + pnl
+            set_state("daily_pnl", daily)
+
+# ==================================================
+# 📄 OPEN TRADE
 # ==================================================
 def open_trade(parsed, price):
     lot = calculate_lot()
+
+    if parsed["action"] == "buy":
+        tp = price + TP_POINTS
+        sl = price - SL_POINTS
+    else:
+        tp = price - TP_POINTS
+        sl = price + SL_POINTS
+
     db().execute("""
         INSERT INTO trades
-        (symbol, action, entry_price, lot, status, pnl, time_open)
-        VALUES (?, ?, ?, ?, 'CLOSED', ?, ?)
+        (symbol, action, entry_price, tp, sl, lot, status, pnl, time_open)
+        VALUES (?, ?, ?, ?, ?, ?, 'OPEN', 0, ?)
     """, (
         parsed["symbol"],
         parsed["action"],
         price,
+        tp,
+        sl,
         lot,
-        TP_POINTS if parsed["action"] == "buy" else -SL_POINTS,
         datetime.utcnow().isoformat()
     )).connection.commit()
-
-    pnl = TP_POINTS if parsed["action"] == "buy" else -SL_POINTS
-    update_balance(pnl)
-
-    daily = float(get_state("daily_pnl")) + pnl
-    set_state("daily_pnl", daily)
 
 # ==================================================
 # 🌐 WEBHOOK
@@ -267,6 +312,12 @@ async def webhook(request: Request):
     if not parsed:
         return {"status": "ignored"}
 
+    price = get_price(parsed["symbol"])
+    if not price:
+        return {"status": "no_price"}
+
+    check_open_trades(parsed["symbol"], price)
+
     if not risk_guard():
         return {"status": "paused"}
 
@@ -275,14 +326,10 @@ async def webhook(request: Request):
     else:
         set_state("engine_status", "PAPER")
 
-    price = get_price(parsed["symbol"])
-    if not price:
-        return {"status": "no_price"}
-
     open_trade(parsed, price)
 
     return {
-        "status": "ok",
+        "status": "trade_opened",
         "engine": get_state("engine_status")
     }
 
@@ -300,7 +347,7 @@ def stats():
 @app.get("/trades")
 def trades(limit: int = 50):
     return db().execute("""
-        SELECT symbol, action, entry_price, pnl, time_open
+        SELECT symbol, action, entry_price, exit_price, pnl, status, time_open
         FROM trades
         ORDER BY id DESC
         LIMIT ?
