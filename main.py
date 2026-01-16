@@ -77,6 +77,20 @@ def init_db():
         )
         """)
 
+        # 🔹 ETAP 19 — PERFORMANCE MEMORY
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS performance_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            action TEXT,
+            trades INTEGER,
+            wins INTEGER,
+            losses INTEGER,
+            net_pnl REAL,
+            last_update TEXT
+        )
+        """)
+
         if con.execute("SELECT COUNT(*) FROM balance").fetchone()[0] == 0:
             con.execute(
                 "INSERT INTO balance VALUES (?, ?)",
@@ -195,7 +209,48 @@ def calculate_lot():
     return round(max(lot, 0.01), 2)
 
 # ==================================================
-# 🧠 TRADE CLASSIFIER (ETAP 18)
+# 📊 PERFORMANCE MEMORY (ETAP 19)
+# ==================================================
+def update_performance(symbol, action, pnl):
+    con = db()
+    cur = con.execute("""
+        SELECT id, trades, wins, losses, net_pnl
+        FROM performance_stats
+        WHERE symbol=? AND action=?
+    """, (symbol, action)).fetchone()
+
+    now = datetime.utcnow().isoformat()
+
+    if cur:
+        pid, trades, wins, losses, net_pnl = cur
+        trades += 1
+        wins += 1 if pnl > 0 else 0
+        losses += 1 if pnl < 0 else 0
+        net_pnl += pnl
+
+        con.execute("""
+            UPDATE performance_stats
+            SET trades=?, wins=?, losses=?, net_pnl=?, last_update=?
+            WHERE id=?
+        """, (trades, wins, losses, net_pnl, now, pid))
+    else:
+        con.execute("""
+            INSERT INTO performance_stats
+            (symbol, action, trades, wins, losses, net_pnl, last_update)
+            VALUES (?, ?, 1, ?, ?, ?, ?)
+        """, (
+            symbol,
+            action,
+            1 if pnl > 0 else 0,
+            1 if pnl < 0 else 0,
+            pnl,
+            now
+        ))
+
+    con.commit()
+
+# ==================================================
+# 🧠 TRADE CLASSIFIER
 # ==================================================
 def classify_trade(parsed, price, sma):
     if get_state("engine_status") != "ACTIVE":
@@ -213,7 +268,6 @@ def classify_trade(parsed, price, sma):
     if parsed["action"] == "sell" and price > sma:
         return False, "above_sma200"
 
-    # open trades limit
     cur = db().execute(
         "SELECT COUNT(*) FROM trades WHERE symbol=? AND status='OPEN'",
         (parsed["symbol"],)
@@ -221,7 +275,6 @@ def classify_trade(parsed, price, sma):
     if cur.fetchone()[0] >= MAX_TRADES_PER_SYMBOL:
         return False, "max_open_trades"
 
-    # cooldown
     cur = db().execute("""
         SELECT time_open FROM trades
         WHERE symbol=?
@@ -233,7 +286,6 @@ def classify_trade(parsed, price, sma):
         if datetime.utcnow() - last < timedelta(minutes=SYMBOL_COOLDOWN_MIN):
             return False, "cooldown"
 
-    # win rate
     cur = db().execute("""
         SELECT pnl FROM trades WHERE symbol=? AND status='CLOSED'
     """, (parsed["symbol"],))
@@ -263,7 +315,13 @@ def open_trade(parsed, price):
     )).connection.commit()
 
 def close_trade(trade_id, pnl, price):
-    db().execute("""
+    con = db()
+    trade = con.execute(
+        "SELECT symbol, action FROM trades WHERE id=?",
+        (trade_id,)
+    ).fetchone()
+
+    con.execute("""
         UPDATE trades
         SET status='CLOSED',
             exit_price=?,
@@ -275,7 +333,11 @@ def close_trade(trade_id, pnl, price):
         pnl,
         datetime.utcnow().isoformat(),
         trade_id
-    )).connection.commit()
+    ))
+    con.commit()
+
+    if trade:
+        update_performance(trade[0], trade[1], pnl)
 
     update_balance(pnl)
     set_state("daily_pnl", float(get_state("daily_pnl")) + pnl)
@@ -290,8 +352,8 @@ def manage_trades(symbol, price, new_action):
     """, (symbol,))
 
     for tid, action, entry, lot in cur.fetchall():
-        dir = 1 if action == "buy" else -1
-        diff = (price - entry) * dir
+        direction = 1 if action == "buy" else -1
+        diff = (price - entry) * direction
 
         if diff >= TP_POINTS:
             close_trade(tid, TP_POINTS * lot * POINT_VALUE, price)
@@ -355,10 +417,16 @@ def stats():
     cur = db().execute("SELECT status, COUNT(*) FROM trades GROUP BY status")
     trades = dict(cur.fetchall())
 
+    perf = db().execute("""
+        SELECT symbol, action, trades, wins, losses, net_pnl
+        FROM performance_stats
+    """).fetchall()
+
     return {
         "balance": get_balance(),
         "engine_status": get_state("engine_status"),
         "daily_pnl": float(get_state("daily_pnl")),
         "peak_balance": float(get_state("peak_balance")),
-        "trades": trades
+        "trades": trades,
+        "performance": perf
     }
