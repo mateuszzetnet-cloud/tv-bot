@@ -28,6 +28,10 @@ TP_POINTS = 20
 SL_POINTS = 10
 POINT_VALUE = 1.0
 
+TRAIL_START = 10
+TRAIL_DISTANCE = 6
+PARTIAL_CLOSE_PCT = 0.5
+
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
 }
@@ -48,10 +52,12 @@ def init_db():
             entry_price REAL,
             tp REAL,
             sl REAL,
-            exit_price REAL,
             lot REAL,
+            remaining_lot REAL,
+            stage INTEGER,
             status TEXT,
             pnl REAL,
+            exit_price REAL,
             time_open TEXT,
             time_close TEXT
         )
@@ -93,7 +99,7 @@ def init_db():
 init_db()
 
 # ==================================================
-# 📊 ENGINE STATE
+# 📊 ENGINE STATE / BALANCE
 # ==================================================
 def get_state(key):
     return db().execute(
@@ -106,9 +112,6 @@ def set_state(key, value):
         (str(value), key)
     ).connection.commit()
 
-# ==================================================
-# 💰 BALANCE
-# ==================================================
 def get_balance():
     return db().execute(
         "SELECT balance FROM balance ORDER BY time DESC LIMIT 1"
@@ -131,23 +134,15 @@ def calculate_lot():
     return round(max(risk / (SL_POINTS * POINT_VALUE), 0.01), 2)
 
 # ==================================================
-# 🔎 PARSER
+# 🔎 PARSER / MARKET
 # ==================================================
 def parse_signal(text: str):
     t = text.lower()
     action = "buy" if "buy" in t else "sell" if "sell" in t else None
     if not action:
         return None
+    return {"symbol": "XAUUSD", "action": action}
 
-    symbol = "XAUUSD" if "xauusd" in t else None
-    if symbol not in SYMBOL_MAP:
-        return None
-
-    return {"symbol": symbol, "action": action}
-
-# ==================================================
-# 📈 MARKET DATA
-# ==================================================
 def get_price(symbol):
     try:
         r = requests.get(
@@ -160,143 +155,73 @@ def get_price(symbol):
         return None
 
 # ==================================================
-# 🧠 PERFORMANCE
+# 🔁 TRADE MANAGEMENT
 # ==================================================
-def performance_stats(symbol):
+def manage_trades(symbol, price):
     rows = db().execute("""
-        SELECT pnl, time_close FROM trades
-        WHERE symbol=? AND status='CLOSED'
+        SELECT id, action, entry_price, sl, lot, remaining_lot, stage
+        FROM trades WHERE status='OPEN' AND symbol=?
     """, (symbol,)).fetchall()
 
-    if len(rows) < 10:
-        return None
+    for t in rows:
+        tid, action, entry, sl, lot, rem, stage = t
+        dir = 1 if action == "buy" else -1
+        move = (price - entry) * dir
 
-    pnls = [r[0] for r in rows]
-    wins = [p for p in pnls if p > 0]
+        # 🔹 PARTIAL CLOSE
+        if stage == 0 and move >= TP_POINTS:
+            closed_lot = lot * PARTIAL_CLOSE_PCT
+            pnl = closed_lot * TP_POINTS * POINT_VALUE
+            update_balance(pnl)
 
-    winrate = len(wins) / len(pnls)
-    expectancy = sum(pnls) / len(pnls)
+            db().execute("""
+                UPDATE trades
+                SET remaining_lot=?, stage=1
+                WHERE id=?
+            """, (lot - closed_lot, tid)).connection.commit()
 
-    bal = START_BALANCE
-    peak = bal
-    max_dd = 0
+        # 🔹 TRAILING STOP
+        if move >= TRAIL_START:
+            new_sl = price - TRAIL_DISTANCE if action == "buy" else price + TRAIL_DISTANCE
+            better = new_sl > sl if action == "buy" else new_sl < sl
+            if better:
+                db().execute(
+                    "UPDATE trades SET sl=?, stage=2 WHERE id=?",
+                    (new_sl, tid)
+                ).connection.commit()
 
-    for p in pnls:
-        bal += p
-        peak = max(peak, bal)
-        max_dd = max(max_dd, (peak - bal) / peak)
-
-    days = {r[1][:10] for r in rows if r[1]}
-
-    return {
-        "trades": len(pnls),
-        "winrate": winrate,
-        "expectancy": expectancy,
-        "max_dd": max_dd,
-        "days": len(days)
-    }
-
-# ==================================================
-# 🧠 LIVE GATE
-# ==================================================
-def check_live_ready(symbol):
-    s = performance_stats(symbol)
-    if not s:
-        return False
-    return (
-        s["trades"] >= 100 and
-        s["winrate"] >= 0.55 and
-        s["expectancy"] > 0 and
-        s["max_dd"] < 0.08 and
-        s["days"] >= 30
-    )
-
-# ==================================================
-# 🛑 RISK GUARD
-# ==================================================
-def risk_guard():
-    today = str(date.today())
-    if get_state("daily_date") != today:
-        set_state("daily_date", today)
-        set_state("daily_pnl", "0")
-
-    daily_pnl = float(get_state("daily_pnl"))
-    if daily_pnl <= -START_BALANCE * MAX_DAILY_LOSS:
-        set_state("engine_status", "PAUSED")
-        return False
-
-    bal = get_balance()
-    peak = float(get_state("peak_balance"))
-    if (peak - bal) / peak >= MAX_DRAWDOWN:
-        set_state("engine_status", "PAUSED")
-        return False
-
-    return True
-
-# ==================================================
-# 🔁 CHECK OPEN TRADES
-# ==================================================
-def check_open_trades(symbol, price):
-    trades = db().execute("""
-        SELECT id, action, entry_price, tp, sl, lot
-        FROM trades
-        WHERE symbol=? AND status='OPEN'
-    """, (symbol,)).fetchall()
-
-    for t in trades:
-        trade_id, action, entry, tp, sl, lot = t
-
-        hit_tp = price >= tp if action == "buy" else price <= tp
+        # 🔹 STOP HIT
         hit_sl = price <= sl if action == "buy" else price >= sl
-
-        if hit_tp or hit_sl:
-            exit_price = tp if hit_tp else sl
-            pnl = (exit_price - entry) * lot * POINT_VALUE
-            if action == "sell":
-                pnl *= -1
+        if hit_sl:
+            pnl = (sl - entry) * rem * POINT_VALUE * dir
+            update_balance(pnl)
 
             db().execute("""
                 UPDATE trades
                 SET status='CLOSED',
-                    exit_price=?,
                     pnl=?,
+                    exit_price=?,
                     time_close=?
                 WHERE id=?
-            """, (
-                exit_price,
-                pnl,
-                datetime.utcnow().isoformat(),
-                trade_id
-            )).connection.commit()
-
-            update_balance(pnl)
-            daily = float(get_state("daily_pnl")) + pnl
-            set_state("daily_pnl", daily)
+            """, (pnl, sl, datetime.utcnow().isoformat(), tid)).connection.commit()
 
 # ==================================================
 # 📄 OPEN TRADE
 # ==================================================
 def open_trade(parsed, price):
     lot = calculate_lot()
-
-    if parsed["action"] == "buy":
-        tp = price + TP_POINTS
-        sl = price - SL_POINTS
-    else:
-        tp = price - TP_POINTS
-        sl = price + SL_POINTS
+    tp = price + TP_POINTS if parsed["action"] == "buy" else price - TP_POINTS
+    sl = price - SL_POINTS if parsed["action"] == "buy" else price + SL_POINTS
 
     db().execute("""
         INSERT INTO trades
-        (symbol, action, entry_price, tp, sl, lot, status, pnl, time_open)
-        VALUES (?, ?, ?, ?, ?, ?, 'OPEN', 0, ?)
+        (symbol, action, entry_price, tp, sl, lot, remaining_lot, stage, status, pnl, time_open)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'OPEN', 0, ?)
     """, (
         parsed["symbol"],
         parsed["action"],
-        price,
-        tp,
-        sl,
-        lot,
+        price, tp, sl,
+        lot, lot,
         datetime.utcnow().isoformat()
     )).connection.commit()
 
@@ -316,22 +241,10 @@ async def webhook(request: Request):
     if not price:
         return {"status": "no_price"}
 
-    check_open_trades(parsed["symbol"], price)
-
-    if not risk_guard():
-        return {"status": "paused"}
-
-    if check_live_ready(parsed["symbol"]):
-        set_state("engine_status", "LIVE")
-    else:
-        set_state("engine_status", "PAPER")
-
+    manage_trades(parsed["symbol"], price)
     open_trade(parsed, price)
 
-    return {
-        "status": "trade_opened",
-        "engine": get_state("engine_status")
-    }
+    return {"status": "ok", "balance": get_balance()}
 
 # ==================================================
 # 📊 STATS
@@ -340,15 +253,5 @@ async def webhook(request: Request):
 def stats():
     return {
         "engine_status": get_state("engine_status"),
-        "balance": get_balance(),
-        "performance": performance_stats("XAUUSD")
+        "balance": get_balance()
     }
-
-@app.get("/trades")
-def trades(limit: int = 50):
-    return db().execute("""
-        SELECT symbol, action, entry_price, exit_price, pnl, status, time_open
-        FROM trades
-        ORDER BY id DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
