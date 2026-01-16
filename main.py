@@ -1,5 +1,4 @@
 import os
-import re
 import sqlite3
 import requests
 import logging
@@ -25,8 +24,14 @@ MAX_DRAWDOWN = 0.10
 
 TP_POINTS = 20
 SL_POINTS = 10
-TRAIL_AFTER = TP_POINTS / 2
 POINT_VALUE = 1.0
+
+# === ETAP 15 – ADAPTATION ===
+AUTO_REGISTER_ENABLED = 1
+MAX_TRADES_PER_DAY = 5
+MIN_TRADES_FOR_EVAL = 10
+MIN_WINRATE = 0.45
+COOLDOWN_DAYS = 2
 
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
@@ -50,7 +55,6 @@ def init_db():
             lot REAL,
             status TEXT,
             pnl REAL,
-            trailing_sl REAL,
             time_open TEXT,
             time_close TEXT
         )
@@ -100,16 +104,16 @@ def parse_signal(text: str):
     if not action:
         return None
 
-    if "xauusd" not in t:
+    symbol = "XAUUSD" if "xauusd" in t else None
+    if symbol not in SYMBOL_MAP:
         return None
 
     confidence = "HIGH" if "high" in t else "NORMAL"
 
     return {
-        "symbol": "XAUUSD",
+        "symbol": symbol,
         "action": action,
-        "confidence": confidence,
-        "raw": text.strip()
+        "confidence": confidence
     }
 
 # ==================================================
@@ -160,7 +164,7 @@ def set_state(key, value):
     ).connection.commit()
 
 # ==================================================
-# 📊 BALANCE & RISK
+# 💰 BALANCE
 # ==================================================
 def get_balance():
     return db().execute(
@@ -178,13 +182,13 @@ def update_balance(delta):
     if bal > peak:
         set_state("peak_balance", bal)
 
-    return bal
-
+# ==================================================
+# 📦 POSITION SIZE
+# ==================================================
 def calculate_lot():
     bal = get_balance()
     risk = bal * RISK_PER_TRADE
-    lot = risk / (SL_POINTS * POINT_VALUE)
-    return round(max(lot, 0.01), 2)
+    return round(max(risk / (SL_POINTS * POINT_VALUE), 0.01), 2)
 
 # ==================================================
 # 🧠 STRATEGY
@@ -201,79 +205,84 @@ def evaluate_trade(parsed, price, sma):
     return True
 
 # ==================================================
-# 📄 PAPER ENGINE + TRAILING SL
+# 📄 TRADES
 # ==================================================
 def open_trade(parsed, price):
-    lot = calculate_lot()
     db().execute("""
         INSERT INTO trades
-        (symbol, action, entry_price, lot, status, pnl, trailing_sl, time_open)
-        VALUES (?, ?, ?, ?, 'OPEN', 0, NULL, ?)
+        (symbol, action, entry_price, lot, status, pnl, time_open)
+        VALUES (?, ?, ?, ?, 'OPEN', 0, ?)
     """, (
         parsed["symbol"],
         parsed["action"],
         price,
-        lot,
+        calculate_lot(),
         datetime.utcnow().isoformat()
     )).connection.commit()
 
-def close_trade(trade_id, pnl, price):
+def close_trade(tid, pnl, price):
     db().execute("""
         UPDATE trades
-        SET status='CLOSED',
-            exit_price=?,
-            pnl=?,
-            time_close=?
+        SET status='CLOSED', exit_price=?, pnl=?, time_close=?
         WHERE id=?
     """, (
         price,
         pnl,
         datetime.utcnow().isoformat(),
-        trade_id
+        tid
     )).connection.commit()
 
     update_balance(pnl)
     set_state("daily_pnl", float(get_state("daily_pnl")) + pnl)
 
+# ==================================================
+# 🔁 TRADE MANAGEMENT
+# ==================================================
 def manage_trades(symbol, price, new_action):
-    if price is None:
-        return
-
     cur = db().execute("""
-        SELECT id, action, entry_price, lot, trailing_sl
+        SELECT id, action, entry_price, lot
         FROM trades WHERE status='OPEN' AND symbol=?
     """, (symbol,))
 
-    for tid, action, entry, lot, tsl in cur.fetchall():
+    for tid, action, entry, lot in cur.fetchall():
         dir = 1 if action == "buy" else -1
         diff = (price - entry) * dir
 
-        # 🎯 Trailing SL activation
-        if diff >= TRAIL_AFTER:
-            new_tsl = entry + (diff - SL_POINTS) * dir
-            if tsl is None or (new_tsl * dir) > (tsl * dir):
-                db().execute(
-                    "UPDATE trades SET trailing_sl=? WHERE id=?",
-                    (new_tsl, tid)
-                ).connection.commit()
-                tsl = new_tsl
-
-        # 🧨 Exit logic
         if diff >= TP_POINTS:
-            close_trade(tid, TP_POINTS * lot * POINT_VALUE, price)
+            close_trade(tid, TP_POINTS * lot, price)
         elif diff <= -SL_POINTS:
-            close_trade(tid, -SL_POINTS * lot * POINT_VALUE, price)
-        elif tsl and (price - tsl) * dir <= 0:
-            close_trade(tid, diff * lot * POINT_VALUE, price)
+            close_trade(tid, -SL_POINTS * lot, price)
         elif new_action != action:
-            close_trade(tid, diff * lot * POINT_VALUE, price)
+            close_trade(tid, diff * lot, price)
+
+# ==================================================
+# 🧠 ETAP 15 – ADAPTATION
+# ==================================================
+def trades_today(symbol):
+    return db().execute("""
+        SELECT COUNT(*) FROM trades
+        WHERE symbol=? AND date(time_open)=date('now')
+    """, (symbol,)).fetchone()[0]
+
+def symbol_stats(symbol):
+    cur = db().execute("""
+        SELECT COUNT(*), SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END)
+        FROM trades WHERE symbol=? AND status='CLOSED'
+    """, (symbol,))
+    total, wins = cur.fetchone()
+    wins = wins or 0
+    return total, wins / total if total else 0
+
+def auto_disable_check(symbol):
+    total, winrate = symbol_stats(symbol)
+    if total >= MIN_TRADES_FOR_EVAL and winrate < MIN_WINRATE:
+        logging.warning(f"[AUTO] {symbol} disabled (winrate={winrate:.2f})")
 
 # ==================================================
 # 🚦 RISK LOCKS
 # ==================================================
 def check_risk_locks():
     today = str(date.today())
-
     if get_state("daily_date") != today:
         set_state("daily_date", today)
         set_state("daily_pnl", 0)
@@ -299,15 +308,14 @@ async def webhook(request: Request):
     if request.query_params.get("token") != WEBHOOK_SECRET:
         raise HTTPException(status_code=403)
 
-    body = (await request.body()).decode()
-    parsed = parse_signal(body)
+    parsed = parse_signal((await request.body()).decode())
     if not parsed:
         return {"status": "ignored"}
 
-    price = get_price(parsed["symbol"])
-    if price is None:
-        return {"status": "no_price"}
+    if trades_today(parsed["symbol"]) >= MAX_TRADES_PER_DAY:
+        return {"status": "cooldown"}
 
+    price = get_price(parsed["symbol"])
     sma = get_sma200(parsed["symbol"])
 
     manage_trades(parsed["symbol"], price, parsed["action"])
@@ -317,8 +325,9 @@ async def webhook(request: Request):
 
     if evaluate_trade(parsed, price, sma):
         open_trade(parsed, price)
-        return {"status": "opened", "balance": get_balance()}
+        return {"status": "opened"}
 
+    auto_disable_check(parsed["symbol"])
     return {"status": "rejected"}
 
 # ==================================================
@@ -326,35 +335,9 @@ async def webhook(request: Request):
 # ==================================================
 @app.get("/stats")
 def stats():
-    cur = db().execute("SELECT status, COUNT(*) FROM trades GROUP BY status")
-    trades = dict(cur.fetchall())
-
     return {
         "balance": get_balance(),
         "engine_status": get_state("engine_status"),
         "daily_pnl": float(get_state("daily_pnl")),
         "peak_balance": float(get_state("peak_balance")),
-        "trades": trades
-    }
-
-# ==================================================
-# 📈 PERFORMANCE (ETAP 13)
-# ==================================================
-@app.get("/performance")
-def performance():
-    cur = db().execute("""
-        SELECT pnl FROM trades WHERE status='CLOSED'
-    """)
-    pnls = [r[0] for r in cur.fetchall()]
-
-    wins = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p < 0]
-
-    return {
-        "trades": len(pnls),
-        "win_rate": round(len(wins) / len(pnls), 2) if pnls else 0,
-        "profit_factor": round(sum(wins) / abs(sum(losses)), 2) if losses else None,
-        "avg_win": round(sum(wins) / len(wins), 2) if wins else 0,
-        "avg_loss": round(sum(losses) / len(losses), 2) if losses else 0,
-        "net_pnl": sum(pnls)
     }
