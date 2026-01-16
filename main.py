@@ -2,7 +2,7 @@ import os
 import sqlite3
 import requests
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from fastapi import FastAPI, Request, HTTPException
 
 # ==================================================
@@ -15,7 +15,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
 DB_FILE = "trading.db"
-START_BALANCE = 1_000.0  # LIVE TARGET
+START_BALANCE = 1_000.0
 
 # ==================================================
 # ⚠️ RISK CONFIG
@@ -23,9 +23,6 @@ START_BALANCE = 1_000.0  # LIVE TARGET
 RISK_PER_TRADE = 0.01
 MAX_DAILY_LOSS = 0.03
 MAX_DRAWDOWN = 0.10
-
-MAX_TRADES_PER_SYMBOL = 1
-SYMBOL_COOLDOWN_MIN = 5
 
 TP_POINTS = 20
 SL_POINTS = 10
@@ -53,7 +50,6 @@ def init_db():
             lot REAL,
             status TEXT,
             pnl REAL,
-            reason TEXT,
             time_open TEXT,
             time_close TEXT
         )
@@ -80,7 +76,7 @@ def init_db():
             )
 
         defaults = {
-            "engine_status": "LEARNING",   # <--- KLUCZ
+            "engine_status": "LEARNING",
             "peak_balance": str(START_BALANCE),
             "daily_date": str(date.today()),
             "daily_pnl": "0"
@@ -95,37 +91,18 @@ def init_db():
 init_db()
 
 # ==================================================
-# 🔎 PARSER
+# 📊 ENGINE STATE
 # ==================================================
-def parse_signal(text: str):
-    t = text.lower()
-    action = "buy" if "buy" in t else "sell" if "sell" in t else None
-    if not action:
-        return None
+def get_state(key):
+    return db().execute(
+        "SELECT value FROM engine_state WHERE key=?", (key,)
+    ).fetchone()[0]
 
-    symbol = "XAUUSD" if "xauusd" in t else None
-    if symbol not in SYMBOL_MAP:
-        return None
-
-    return {
-        "symbol": symbol,
-        "action": action,
-        "raw": text.strip()
-    }
-
-# ==================================================
-# 📈 MARKET DATA
-# ==================================================
-def get_price(symbol):
-    try:
-        r = requests.get(
-            "https://api.twelvedata.com/price",
-            params={"symbol": SYMBOL_MAP[symbol], "apikey": TWELVE_API_KEY},
-            timeout=5
-        ).json()
-        return float(r["price"])
-    except Exception:
-        return None
+def set_state(key, value):
+    db().execute(
+        "UPDATE engine_state SET value=? WHERE key=?",
+        (str(value), key)
+    ).connection.commit()
 
 # ==================================================
 # 💰 BALANCE
@@ -152,21 +129,36 @@ def calculate_lot():
     return round(max(risk / (SL_POINTS * POINT_VALUE), 0.01), 2)
 
 # ==================================================
-# 📊 ENGINE STATE
+# 🔎 PARSER
 # ==================================================
-def get_state(key):
-    return db().execute(
-        "SELECT value FROM engine_state WHERE key=?", (key,)
-    ).fetchone()[0]
+def parse_signal(text: str):
+    t = text.lower()
+    action = "buy" if "buy" in t else "sell" if "sell" in t else None
+    if not action:
+        return None
 
-def set_state(key, value):
-    db().execute(
-        "UPDATE engine_state SET value=? WHERE key=?",
-        (str(value), key)
-    ).connection.commit()
+    symbol = "XAUUSD" if "xauusd" in t else None
+    if symbol not in SYMBOL_MAP:
+        return None
+
+    return {"symbol": symbol, "action": action}
 
 # ==================================================
-# 🧠 ETAP 19 — PERFORMANCE ANALYTICS
+# 📈 MARKET DATA
+# ==================================================
+def get_price(symbol):
+    try:
+        r = requests.get(
+            "https://api.twelvedata.com/price",
+            params={"symbol": SYMBOL_MAP[symbol], "apikey": TWELVE_API_KEY},
+            timeout=5
+        ).json()
+        return float(r["price"])
+    except Exception:
+        return None
+
+# ==================================================
+# 🧠 PERFORMANCE
 # ==================================================
 def performance_stats(symbol):
     rows = db().execute("""
@@ -179,24 +171,20 @@ def performance_stats(symbol):
 
     pnls = [r[0] for r in rows]
     wins = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
 
     winrate = len(wins) / len(pnls)
     expectancy = sum(pnls) / len(pnls)
 
-    balance = START_BALANCE
-    peak = balance
+    bal = START_BALANCE
+    peak = bal
     max_dd = 0
 
     for p in pnls:
-        balance += p
-        peak = max(peak, balance)
-        dd = (peak - balance) / peak
-        max_dd = max(max_dd, dd)
+        bal += p
+        peak = max(peak, bal)
+        max_dd = max(max_dd, (peak - bal) / peak)
 
-    days = {
-        r[1][:10] for r in rows if r[1]
-    }
+    days = {r[1][:10] for r in rows if r[1]}
 
     return {
         "trades": len(pnls),
@@ -207,54 +195,65 @@ def performance_stats(symbol):
     }
 
 # ==================================================
-# 🧠 ETAP 20 — LIVE GATE
+# 🧠 LIVE GATE (ETAP 20)
 # ==================================================
 def check_live_ready(symbol):
-    stats = performance_stats(symbol)
-    if not stats:
+    s = performance_stats(symbol)
+    if not s:
         return False
-
     return (
-        stats["trades"] >= 100 and
-        stats["winrate"] >= 0.55 and
-        stats["expectancy"] > 0 and
-        stats["max_dd"] < 0.08 and
-        stats["days"] >= 30
+        s["trades"] >= 100 and
+        s["winrate"] >= 0.55 and
+        s["expectancy"] > 0 and
+        s["max_dd"] < 0.08 and
+        s["days"] >= 30
     )
 
 # ==================================================
-# 📄 PAPER ENGINE
+# 🛑 RISK GUARD (ETAP 21)
+# ==================================================
+def risk_guard():
+    today = str(date.today())
+    if get_state("daily_date") != today:
+        set_state("daily_date", today)
+        set_state("daily_pnl", "0")
+
+    daily_pnl = float(get_state("daily_pnl"))
+    if daily_pnl <= -START_BALANCE * MAX_DAILY_LOSS:
+        set_state("engine_status", "PAUSED")
+        return False
+
+    bal = get_balance()
+    peak = float(get_state("peak_balance"))
+    if (peak - bal) / peak >= MAX_DRAWDOWN:
+        set_state("engine_status", "PAUSED")
+        return False
+
+    return True
+
+# ==================================================
+# 📄 PAPER TRADE
 # ==================================================
 def open_trade(parsed, price):
     lot = calculate_lot()
     db().execute("""
         INSERT INTO trades
         (symbol, action, entry_price, lot, status, pnl, time_open)
-        VALUES (?, ?, ?, ?, 'OPEN', 0, ?)
+        VALUES (?, ?, ?, ?, 'CLOSED', ?, ?)
     """, (
         parsed["symbol"],
         parsed["action"],
         price,
         lot,
+        TP_POINTS if parsed["action"] == "buy" else -SL_POINTS,
         datetime.utcnow().isoformat()
     )).connection.commit()
 
-def close_trade(trade_id, pnl, price):
-    db().execute("""
-        UPDATE trades
-        SET status='CLOSED',
-            exit_price=?,
-            pnl=?,
-            time_close=?
-        WHERE id=?
-    """, (
-        price,
-        pnl,
-        datetime.utcnow().isoformat(),
-        trade_id
-    )).connection.commit()
-
+    pnl = TP_POINTS if parsed["action"] == "buy" else -SL_POINTS
     update_balance(pnl)
+
+    daily = float(get_state("daily_pnl")) + pnl
+    set_state("daily_pnl", daily)
 
 # ==================================================
 # 🌐 WEBHOOK
@@ -264,23 +263,26 @@ async def webhook(request: Request):
     if request.query_params.get("token") != WEBHOOK_SECRET:
         raise HTTPException(status_code=403)
 
-    body = (await request.body()).decode()
-    parsed = parse_signal(body)
+    parsed = parse_signal((await request.body()).decode())
     if not parsed:
         return {"status": "ignored"}
 
-    price = get_price(parsed["symbol"])
-    if price is None:
-        return {"status": "no_price"}
+    if not risk_guard():
+        return {"status": "paused"}
 
-    # LEARNING MODE
     if check_live_ready(parsed["symbol"]):
         set_state("engine_status", "LIVE")
+    else:
+        set_state("engine_status", "PAPER")
+
+    price = get_price(parsed["symbol"])
+    if not price:
+        return {"status": "no_price"}
 
     open_trade(parsed, price)
 
     return {
-        "status": "paper_trade",
+        "status": "ok",
         "engine": get_state("engine_status")
     }
 
@@ -289,19 +291,17 @@ async def webhook(request: Request):
 # ==================================================
 @app.get("/stats")
 def stats():
-    symbol = "XAUUSD"
     return {
         "engine_status": get_state("engine_status"),
         "balance": get_balance(),
-        "performance": performance_stats(symbol)
+        "performance": performance_stats("XAUUSD")
     }
 
 @app.get("/trades")
 def trades(limit: int = 50):
-    cur = db().execute("""
-        SELECT symbol, action, entry_price, exit_price, pnl, status, time_open
+    return db().execute("""
+        SELECT symbol, action, entry_price, pnl, time_open
         FROM trades
         ORDER BY id DESC
         LIMIT ?
-    """, (limit,))
-    return cur.fetchall()
+    """, (limit,)).fetchall()
