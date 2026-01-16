@@ -295,3 +295,13 @@ def stats():
         "balance": get_balance(),
         "performance": performance_stats(symbol)
     }
+
+@app.get("/trades")
+def trades(limit: int = 50):
+    cur = db().execute("""
+        SELECT symbol, action, entry_price, exit_price, pnl, status, time_open
+        FROM trades
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,))
+    return cur.fetchall()
