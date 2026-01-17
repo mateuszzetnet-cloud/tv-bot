@@ -255,3 +255,77 @@ def stats():
         "engine_status": get_state("engine_status"),
         "balance": get_balance()
     }
+# ==================================================
+# 📊 PERFORMANCE ANALYTICS (FIX)
+# ==================================================
+def performance_stats(symbol):
+    rows = db().execute("""
+        SELECT pnl, time_close FROM trades
+        WHERE symbol=? AND status='CLOSED'
+    """, (symbol,)).fetchall()
+
+    if len(rows) < 5:
+        return None
+
+    pnls = [r[0] for r in rows]
+    wins = [p for p in pnls if p > 0]
+
+    winrate = len(wins) / len(pnls)
+    expectancy = sum(pnls) / len(pnls)
+
+    balance = START_BALANCE
+    peak = balance
+    max_dd = 0
+
+    for p in pnls:
+        balance += p
+        peak = max(peak, balance)
+        dd = (peak - balance) / peak
+        max_dd = max(max_dd, dd)
+
+    days = {
+        r[1][:10] for r in rows if r[1]
+    }
+
+    return {
+        "trades": len(pnls),
+        "winrate": round(winrate, 3),
+        "expectancy": round(expectancy, 2),
+        "max_dd": round(max_dd, 3),
+        "days": len(days)
+    }
+
+# ==================================================
+# 📄 TRADES ENDPOINT (FIX)
+# ==================================================
+@app.get("/trades")
+def trades(limit: int = 50):
+    cur = db().execute("""
+        SELECT
+            id,
+            symbol,
+            action,
+            entry_price,
+            exit_price,
+            pnl,
+            status,
+            stage,
+            time_open,
+            time_close
+        FROM trades
+        ORDER BY id DESC
+        LIMIT ?
+    """, (limit,))
+    return cur.fetchall()
+
+# ==================================================
+# 📊 STATS (EXTENDED)
+# ==================================================
+@app.get("/stats")
+def stats():
+    symbol = "XAUUSD"
+    return {
+        "engine_status": get_state("engine_status"),
+        "balance": get_balance(),
+        "performance": performance_stats(symbol)
+    }
