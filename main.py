@@ -15,9 +15,15 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
 DB_FILE = "trading.db"
-START_BALANCE = 1_000.0
+START_BALANCE = 1000.0
 
+# ==================================================
+# RISK / CAPITAL CONFIG
+# ==================================================
 BASE_RISK = 0.01
+MAX_DAILY_LOSS = 0.03
+MAX_DRAWDOWN = 0.10
+
 BASE_TP = 20
 BASE_SL = 10
 POINT_VALUE = 1.0
@@ -77,7 +83,6 @@ def init_db():
         CREATE TABLE IF NOT EXISTS strategy_state (
             symbol TEXT,
             strategy TEXT,
-            weight REAL,
             tp_mult REAL,
             sl_mult REAL,
             status TEXT,
@@ -119,7 +124,7 @@ def init_db():
             for strat in STRATEGIES:
                 con.execute("""
                     INSERT OR IGNORE INTO strategy_state
-                    VALUES (?, ?, 1.0, 1.0, 1.0, 'ACTIVE')
+                    VALUES (?, ?, 1.0, 1.0, 'ACTIVE')
                 """, (s, strat))
 
 init_db()
@@ -150,6 +155,10 @@ def update_balance(delta):
         (datetime.utcnow().isoformat(), bal)
     ).connection.commit()
 
+    peak = float(get_state("peak_balance"))
+    if bal > peak:
+        set_state("peak_balance", bal)
+
 # ==================================================
 # PRICE
 # ==================================================
@@ -163,6 +172,43 @@ def get_price(symbol):
         return float(r["price"])
     except Exception:
         return None
+
+# ==================================================
+# PERFORMANCE / STATS
+# ==================================================
+def performance_stats(symbol):
+    rows = db().execute("""
+        SELECT pnl, time_close FROM trades
+        WHERE symbol=? AND status='CLOSED'
+    """, (symbol,)).fetchall()
+
+    if len(rows) < 5:
+        return None
+
+    pnls = [r[0] for r in rows]
+    wins = [p for p in pnls if p > 0]
+
+    winrate = len(wins) / len(pnls)
+    expectancy = sum(pnls) / len(pnls)
+
+    balance = START_BALANCE
+    peak = balance
+    max_dd = 0
+
+    for p in pnls:
+        balance += p
+        peak = max(peak, balance)
+        max_dd = max(max_dd, (peak - balance) / peak)
+
+    days = {r[1][:10] for r in rows if r[1]}
+
+    return {
+        "trades": len(pnls),
+        "winrate": round(winrate, 3),
+        "expectancy": round(expectancy, 2),
+        "max_dd": round(max_dd, 3),
+        "days": len(days)
+    }
 
 # ==================================================
 # CONTEXT BLOCK
@@ -187,50 +233,42 @@ def penalize_context(symbol, strategy):
     )).connection.commit()
 
 # ==================================================
-# ADAPTIVE TP / SL — ETAP 30
+# ADAPTIVE TP / SL + CAPITAL SCALING (ETAP 31)
 # ==================================================
 def adaptive_levels(symbol, strategy):
-    row = db().execute("""
+    tp_mult, sl_mult = db().execute("""
         SELECT tp_mult, sl_mult FROM strategy_state
         WHERE symbol=? AND strategy=?
     """, (symbol, strategy)).fetchone()
 
-    return (
-        BASE_TP * row[0],
-        BASE_SL * row[1]
-    )
+    return BASE_TP * tp_mult, BASE_SL * sl_mult
 
-def update_adaptive(symbol, strategy):
-    rows = db().execute("""
-        SELECT pnl FROM trades
-        WHERE symbol=? AND strategy=? AND status='CLOSED'
-        ORDER BY id DESC LIMIT 20
-    """, (symbol, strategy)).fetchall()
+def scaled_risk():
+    stats = performance_stats("XAUUSD")
+    if not stats:
+        return BASE_RISK
 
-    if len(rows) < 10:
-        return
+    if stats["winrate"] > 0.6 and stats["max_dd"] < 0.05:
+        return min(BASE_RISK * 1.5, 0.02)
 
-    pnls = [r[0] for r in rows]
-    winrate = len([p for p in pnls if p > 0]) / len(pnls)
+    if stats["max_dd"] > 0.08:
+        return BASE_RISK * 0.5
 
-    tp_mult = 1.1 if winrate > 0.6 else 0.9
-    sl_mult = 0.9 if winrate < 0.45 else 1.0
-
-    db().execute("""
-        UPDATE strategy_state
-        SET tp_mult=?, sl_mult=?
-        WHERE symbol=? AND strategy=?
-    """, (tp_mult, sl_mult, symbol, strategy)).connection.commit()
+    return BASE_RISK
 
 # ==================================================
 # TRADING
 # ==================================================
 def open_trade(symbol, strategy, action, price):
+    if get_state("engine_status") == "LOCKED":
+        return
+
     if is_context_blocked(symbol, strategy):
         return
 
     tp, sl = adaptive_levels(symbol, strategy)
-    lot = round((get_balance() * BASE_RISK) / (sl * POINT_VALUE), 2)
+    risk = scaled_risk()
+    lot = round((get_balance() * risk) / (sl * POINT_VALUE), 2)
 
     db().execute("""
         INSERT INTO trades
@@ -251,10 +289,24 @@ def close_trade(trade_id, symbol, strategy, pnl, price):
     )).connection.commit()
 
     update_balance(pnl)
-    update_adaptive(symbol, strategy)
 
     if pnl <= 0:
         penalize_context(symbol, strategy)
+
+# ==================================================
+# RISK LOCKS
+# ==================================================
+def check_risk_locks():
+    today = str(date.today())
+    if get_state("daily_date") != today:
+        set_state("daily_date", today)
+        set_state("daily_pnl", 0)
+
+    bal = get_balance()
+    peak = float(get_state("peak_balance"))
+
+    if (peak - bal) / peak >= MAX_DRAWDOWN:
+        set_state("engine_status", "LOCKED")
 
 # ==================================================
 # WEBHOOK
@@ -269,19 +321,29 @@ async def webhook(request: Request):
     if not action:
         return {"status": "ignored"}
 
+    check_risk_locks()
+
     for symbol in SYMBOL_MAP:
         price = get_price(symbol)
-        if price is None:
+        if not price:
             continue
 
         for strat in STRATEGIES:
             open_trade(symbol, strat, action, price)
 
-    return {"status": "accepted", "engine": get_state("engine_status")}
+    return {"status": "ok", "engine": get_state("engine_status")}
 
 # ==================================================
-# DASHBOARD
+# ENDPOINTS
 # ==================================================
+@app.get("/stats")
+def stats():
+    return {
+        "engine": get_state("engine_status"),
+        "balance": get_balance(),
+        "performance": performance_stats("XAUUSD")
+    }
+
 @app.get("/dashboard")
 def dashboard():
     return {
