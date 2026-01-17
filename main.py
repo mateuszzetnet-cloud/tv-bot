@@ -2,8 +2,10 @@ import os
 import sqlite3
 import requests
 import logging
+import csv
 from datetime import datetime, date, timedelta
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import FileResponse
 
 # ==================================================
 # APP
@@ -16,6 +18,9 @@ TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
 DB_FILE = "trading.db"
 START_BALANCE = 1000.0
+
+EXPORT_DIR = "exports"
+os.makedirs(EXPORT_DIR, exist_ok=True)
 
 # ==================================================
 # CONFIG
@@ -168,7 +173,7 @@ def get_price(symbol):
         return None
 
 # ==================================================
-# CONTEXT
+# CONTEXT / ADAPTIVE
 # ==================================================
 def is_context_blocked(symbol, strategy):
     now = datetime.utcnow()
@@ -188,18 +193,12 @@ def penalize_context(symbol, strategy):
         (now + timedelta(hours=6)).isoformat()
     )).connection.commit()
 
-# ==================================================
-# ADAPTIVE LEVELS
-# ==================================================
 def adaptive_levels(symbol, strategy):
     tp_mult, sl_mult = db().execute("""
         SELECT tp_mult, sl_mult FROM strategy_state
         WHERE symbol=? AND strategy=?
     """, (symbol, strategy)).fetchone()
     return BASE_TP * tp_mult, BASE_SL * sl_mult
-
-def scaled_risk():
-    return BASE_RISK
 
 # ==================================================
 # TRADE ENGINE
@@ -211,8 +210,7 @@ def open_trade(symbol, strategy, action, price):
         return
 
     tp, sl = adaptive_levels(symbol, strategy)
-    risk = scaled_risk()
-    lot = round((get_balance() * risk) / (sl * POINT_VALUE), 2)
+    lot = round((get_balance() * BASE_RISK) / (sl * POINT_VALUE), 2)
 
     db().execute("""
         INSERT INTO trades
@@ -261,20 +259,6 @@ def manage_open_trades():
                 close_trade(r, price)
 
 # ==================================================
-# RISK LOCKS
-# ==================================================
-def check_risk_locks():
-    today = str(date.today())
-    if get_state("daily_date") != today:
-        set_state("daily_date", today)
-        set_state("daily_pnl", 0)
-
-    bal = get_balance()
-    peak = float(get_state("peak_balance"))
-    if (peak - bal) / peak >= MAX_DRAWDOWN:
-        set_state("engine_status", "LOCKED")
-
-# ==================================================
 # WEBHOOK
 # ==================================================
 @app.post("/webhook")
@@ -288,7 +272,6 @@ async def webhook(request: Request):
         return {"status": "ignored"}
 
     manage_open_trades()
-    check_risk_locks()
 
     for symbol in SYMBOL_MAP:
         price = get_price(symbol)
@@ -300,13 +283,23 @@ async def webhook(request: Request):
     return {"status": "ok", "engine": get_state("engine_status")}
 
 # ==================================================
-# ENDPOINTS
+# STATS / DASHBOARD
 # ==================================================
 @app.get("/stats")
 def stats():
+    trades = db().execute(
+        "SELECT pnl FROM trades WHERE status='CLOSED'"
+    ).fetchall()
+
+    pnls = [t[0] for t in trades]
+    wins = len([p for p in pnls if p > 0])
+
     return {
         "engine": get_state("engine_status"),
-        "balance": get_balance()
+        "balance": get_balance(),
+        "trades": len(pnls),
+        "winrate": round(wins / len(pnls), 2) if pnls else None,
+        "expectancy": round(sum(pnls) / len(pnls), 2) if pnls else None
     }
 
 @app.get("/dashboard")
@@ -325,3 +318,28 @@ def trades(limit: int = 50):
         SELECT symbol, strategy, action, pnl, status, time_open
         FROM trades ORDER BY id DESC LIMIT ?
     """, (limit,)).fetchall()
+
+# ==================================================
+# EXPORT
+# ==================================================
+@app.get("/export/trades")
+def export_trades():
+    path = f"{EXPORT_DIR}/trades.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["symbol", "strategy", "action", "pnl", "status", "open", "close"])
+        for r in db().execute("""
+            SELECT symbol, strategy, action, pnl, status, time_open, time_close FROM trades
+        """):
+            writer.writerow(r)
+    return FileResponse(path, filename="trades.csv")
+
+@app.get("/export/equity")
+def export_equity():
+    path = f"{EXPORT_DIR}/equity.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time", "balance"])
+        for r in db().execute("SELECT * FROM balance"):
+            writer.writerow(r)
+    return FileResponse(path, filename="equity.csv")
