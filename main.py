@@ -2,9 +2,12 @@ import os
 import sqlite3
 import requests
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from fastapi import FastAPI, Request, HTTPException
 
+# ==================================================
+# 🔧 APP
+# ==================================================
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 
@@ -14,22 +17,29 @@ TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 DB_FILE = "trading.db"
 START_BALANCE = 1_000.0
 
-# =========================
-# RISK CONFIG
-# =========================
-BASE_RISK = 0.01
-MIN_RISK = 0.005
-MAX_RISK = 0.02
+# ==================================================
+# ⚠️ RISK CONFIG
+# ==================================================
+RISK_PER_TRADE = 0.01
+MAX_DAILY_LOSS = 0.03
+MAX_DRAWDOWN = 0.10
 
 TP_POINTS = 20
 SL_POINTS = 10
 POINT_VALUE = 1.0
 
-SYMBOL_MAP = {"XAUUSD": "XAU/USD"}
+SYMBOL_MAP = {
+    "XAUUSD": "XAU/USD",
+}
 
-# =========================
-# DATABASE
-# =========================
+DISABLE_DD = 0.08
+COOLDOWN_DAYS = 14
+TEST_MIN_TRADES = 30
+TEST_MIN_WINRATE = 0.55
+
+# ==================================================
+# 🗄️ DATABASE
+# ==================================================
 def db():
     return sqlite3.connect(DB_FILE, check_same_thread=False)
 
@@ -39,7 +49,6 @@ def init_db():
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT,
-            strategy TEXT,
             action TEXT,
             entry_price REAL,
             exit_price REAL,
@@ -50,16 +59,27 @@ def init_db():
             time_close TEXT
         )
         """)
+
         con.execute("""
         CREATE TABLE IF NOT EXISTS balance (
             time TEXT,
             balance REAL
         )
         """)
+
         con.execute("""
         CREATE TABLE IF NOT EXISTS engine_state (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+        """)
+
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS strategy_state (
+            symbol TEXT PRIMARY KEY,
+            status TEXT,
+            disabled_until TEXT,
+            last_reason TEXT
         )
         """)
 
@@ -70,40 +90,44 @@ def init_db():
             )
 
         defaults = {
-            "adaptive_risk": str(BASE_RISK),
+            "engine_status": "LEARNING",
+            "peak_balance": str(START_BALANCE),
+            "daily_date": str(date.today()),
+            "daily_pnl": "0"
         }
+
         for k, v in defaults.items():
             con.execute(
                 "INSERT OR IGNORE INTO engine_state VALUES (?, ?)",
                 (k, v)
             )
 
-        # 🔧 migrate legacy trades
-        con.execute("""
-            UPDATE trades
-            SET strategy='LEGACY'
-            WHERE strategy IS NULL
-        """)
+        for s in SYMBOL_MAP:
+            con.execute("""
+                INSERT OR IGNORE INTO strategy_state
+                VALUES (?, 'ACTIVE', NULL, NULL)
+            """, (s,))
 
 init_db()
 
-# =========================
-# ENGINE STATE
-# =========================
-def get_state(key):
-    return db().execute(
-        "SELECT value FROM engine_state WHERE key=?", (key,)
-    ).fetchone()[0]
+# ==================================================
+# 🔎 PARSER
+# ==================================================
+def parse_signal(text: str):
+    t = text.lower()
+    action = "buy" if "buy" in t else "sell" if "sell" in t else None
+    if not action:
+        return None
 
-def set_state(key, value):
-    db().execute(
-        "UPDATE engine_state SET value=? WHERE key=?",
-        (str(value), key)
-    ).connection.commit()
+    symbol = "XAUUSD" if "xauusd" in t else None
+    if symbol not in SYMBOL_MAP:
+        return None
 
-# =========================
-# MARKET DATA
-# =========================
+    return {"symbol": symbol, "action": action}
+
+# ==================================================
+# 📈 MARKET DATA
+# ==================================================
 def get_price(symbol):
     try:
         r = requests.get(
@@ -115,118 +139,212 @@ def get_price(symbol):
     except Exception:
         return None
 
-# =========================
-# BALANCE & RISK
-# =========================
+# ==================================================
+# 💰 BALANCE
+# ==================================================
 def get_balance():
     return db().execute(
         "SELECT balance FROM balance ORDER BY time DESC LIMIT 1"
     ).fetchone()[0]
 
-def adaptive_risk():
+def update_balance(delta):
+    bal = get_balance() + delta
+    db().execute(
+        "INSERT INTO balance VALUES (?, ?)",
+        (datetime.utcnow().isoformat(), bal)
+    ).connection.commit()
+
+# ==================================================
+# 📊 ENGINE STATE
+# ==================================================
+def get_state(key):
+    return db().execute(
+        "SELECT value FROM engine_state WHERE key=?", (key,)
+    ).fetchone()[0]
+
+def set_state(key, value):
+    db().execute(
+        "UPDATE engine_state SET value=? WHERE key=?",
+        (str(value), key)
+    ).connection.commit()
+
+# ==================================================
+# 🧠 PERFORMANCE
+# ==================================================
+def performance_stats(symbol):
     rows = db().execute("""
-        SELECT pnl FROM trades
-        WHERE status='CLOSED'
-        ORDER BY id DESC LIMIT 20
-    """).fetchall()
+        SELECT pnl, time_close FROM trades
+        WHERE symbol=? AND status='CLOSED'
+    """, (symbol,)).fetchall()
 
     if len(rows) < 10:
-        return MIN_RISK
+        return None
 
     pnls = [r[0] for r in rows]
-    winrate = len([p for p in pnls if p > 0]) / len(pnls)
+    wins = [p for p in pnls if p > 0]
 
-    risk = BASE_RISK
-    if winrate > 0.6:
-        risk += 0.005
-    if winrate > 0.7:
-        risk += 0.005
+    balance = START_BALANCE
+    peak = balance
+    max_dd = 0
 
-    risk = max(MIN_RISK, min(MAX_RISK, risk))
-    set_state("adaptive_risk", risk)
-    return risk
+    for p in pnls:
+        balance += p
+        peak = max(peak, balance)
+        dd = (peak - balance) / peak
+        max_dd = max(max_dd, dd)
 
-def calculate_lot():
-    bal = get_balance()
-    risk = adaptive_risk()
-    return round(max((bal * risk) / (SL_POINTS * POINT_VALUE), 0.01), 2)
+    days = {r[1][:10] for r in rows if r[1]}
 
-# =========================
-# STRATEGY FILTER
-# =========================
-def strategy_allowed(strategy: str):
-    rows = db().execute("""
-        SELECT pnl FROM trades
-        WHERE strategy=? AND status='CLOSED'
-        ORDER BY id DESC LIMIT 30
-    """, (strategy,)).fetchall()
+    return {
+        "trades": len(pnls),
+        "winrate": len(wins) / len(pnls),
+        "expectancy": sum(pnls) / len(pnls),
+        "max_dd": max_dd,
+        "days": len(days)
+    }
 
-    if len(rows) < 20:
-        return True
+# ==================================================
+# 🧠 STRATEGY STATE MANAGER (ETAP 26)
+# ==================================================
+def update_strategy_state(symbol):
+    stats = performance_stats(symbol)
+    if not stats:
+        return
 
-    winrate = len([r for r in rows if r[0] > 0]) / len(rows)
-    return winrate >= 0.45
+    cur = db().execute("""
+        SELECT status, disabled_until FROM strategy_state WHERE symbol=?
+    """, (symbol,))
+    status, disabled_until = cur.fetchone()
 
-# =========================
-# WEBHOOK
-# =========================
+    now = datetime.utcnow()
+
+    if status == "DISABLED":
+        if disabled_until and now >= datetime.fromisoformat(disabled_until):
+            db().execute("""
+                UPDATE strategy_state
+                SET status='TESTING', disabled_until=NULL
+                WHERE symbol=?
+            """, (symbol,))
+            db().connection.commit()
+        return
+
+    if stats["max_dd"] >= DISABLE_DD:
+        until = (now + timedelta(days=COOLDOWN_DAYS)).isoformat()
+        db().execute("""
+            UPDATE strategy_state
+            SET status='DISABLED',
+                disabled_until=?,
+                last_reason='max_dd'
+            WHERE symbol=?
+        """, (until, symbol))
+        db().connection.commit()
+        return
+
+    if status == "TESTING":
+        if (
+            stats["trades"] >= TEST_MIN_TRADES and
+            stats["winrate"] >= TEST_MIN_WINRATE and
+            stats["expectancy"] > 0
+        ):
+            db().execute("""
+                UPDATE strategy_state
+                SET status='ACTIVE', last_reason=NULL
+                WHERE symbol=?
+            """, (symbol,))
+            db().connection.commit()
+
+# ==================================================
+# 📄 TRADING
+# ==================================================
+def open_trade(symbol, action, price):
+    lot = round((get_balance() * RISK_PER_TRADE) / (SL_POINTS * POINT_VALUE), 2)
+    db().execute("""
+        INSERT INTO trades
+        (symbol, action, entry_price, lot, status, pnl, time_open)
+        VALUES (?, ?, ?, ?, 'OPEN', 0, ?)
+    """, (symbol, action, price, lot, datetime.utcnow().isoformat()))
+    db().connection.commit()
+
+def close_trade(trade_id, pnl, price):
+    db().execute("""
+        UPDATE trades
+        SET status='CLOSED',
+            exit_price=?,
+            pnl=?,
+            time_close=?
+        WHERE id=?
+    """, (price, pnl, datetime.utcnow().isoformat(), trade_id))
+    db().connection.commit()
+    update_balance(pnl)
+
+# ==================================================
+# 🌐 WEBHOOK
+# ==================================================
 @app.post("/webhook")
 async def webhook(request: Request):
     if request.query_params.get("token") != WEBHOOK_SECRET:
         raise HTTPException(status_code=403)
 
-    text = (await request.body()).decode().upper()
-
-    action = "BUY" if "BUY" in text else "SELL" if "SELL" in text else None
-    if not action:
+    parsed = parse_signal((await request.body()).decode())
+    if not parsed:
         return {"status": "ignored"}
 
-    strategy = "UNKNOWN"
-    if "STRAT:" in text:
-        strategy = text.split("STRAT:")[1].strip().split()[0]
+    update_strategy_state(parsed["symbol"])
 
-    if not strategy_allowed(strategy):
-        return {"status": "strategy_blocked", "strategy": strategy}
+    state = db().execute("""
+        SELECT status FROM strategy_state WHERE symbol=?
+    """, (parsed["symbol"],)).fetchone()[0]
 
-    symbol = "XAUUSD"
-    price = get_price(symbol)
-    if not price:
-        return {"status": "no_price"}
+    if state == "DISABLED":
+        return {"status": "blocked", "reason": "strategy_disabled"}
 
-    lot = calculate_lot()
+    price = get_price(parsed["symbol"])
+    if price:
+        open_trade(parsed["symbol"], parsed["action"], price)
 
-    db().execute("""
-        INSERT INTO trades
-        (symbol, strategy, action, entry_price, lot, status, pnl, time_open)
-        VALUES (?, ?, ?, ?, ?, 'OPEN', 0, ?)
-    """, (
-        symbol, strategy, action.lower(), price, lot,
-        datetime.utcnow().isoformat()
-    )).connection.commit()
+    return {"status": "ok", "strategy_state": state}
+
+# ==================================================
+# 📊 DASHBOARD
+# ==================================================
+@app.get("/dashboard")
+def dashboard():
+    strategies = []
+    for s in SYMBOL_MAP:
+        stats = performance_stats(s)
+        row = db().execute("""
+            SELECT status, disabled_until FROM strategy_state WHERE symbol=?
+        """, (s,)).fetchone()
+
+        strategies.append({
+            "symbol": s,
+            "status": row[0],
+            "disabled_until": row[1],
+            "stats": stats
+        })
 
     return {
-        "status": "opened",
-        "strategy": strategy,
-        "risk": float(get_state("adaptive_risk"))
+        "engine": {
+            "mode": get_state("engine_status"),
+            "balance": get_balance()
+        },
+        "strategies": strategies
     }
 
-# =========================
-# ENDPOINTS
-# =========================
+# ==================================================
+# 📊 STATS & TRADES
+# ==================================================
 @app.get("/stats")
 def stats():
     return {
-        "balance": get_balance(),
-        "adaptive_risk": float(get_state("adaptive_risk"))
+        "engine_status": get_state("engine_status"),
+        "balance": get_balance()
     }
 
 @app.get("/trades")
 def trades(limit: int = 50):
-    rows = db().execute("""
-        SELECT symbol, strategy, action, entry_price, exit_price,
-               pnl, status, time_open
-        FROM trades
-        ORDER BY id DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
-    return rows
+    cur = db().execute("""
+        SELECT symbol, action, entry_price, exit_price, pnl, status, time_open
+        FROM trades ORDER BY id DESC LIMIT ?
+    """, (limit,))
+    return cur.fetchall()
