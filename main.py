@@ -2,7 +2,7 @@ import os
 import sqlite3
 import requests
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from fastapi import FastAPI, Request, HTTPException
 
 # ==================================================
@@ -18,16 +18,12 @@ DB_FILE = "trading.db"
 START_BALANCE = 1_000.0
 
 BASE_RISK = 0.01
-TP_POINTS = 20
-SL_POINTS = 10
+BASE_TP = 20
+BASE_SL = 10
 POINT_VALUE = 1.0
 
 SYMBOL_MAP = {
     "XAUUSD": "XAU/USD",
-    "EURUSD": "EUR/USD",
-    "GBPUSD": "GBP/USD",
-    "BTCUSD": "BTC/USD",
-    "ETHUSD": "ETH/USD",
 }
 
 STRATEGIES = [
@@ -71,12 +67,20 @@ def init_db():
         """)
 
         con.execute("""
+        CREATE TABLE IF NOT EXISTS engine_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+
+        con.execute("""
         CREATE TABLE IF NOT EXISTS strategy_state (
             symbol TEXT,
             strategy TEXT,
             weight REAL,
+            tp_mult REAL,
+            sl_mult REAL,
             status TEXT,
-            last_eval TEXT,
             PRIMARY KEY (symbol, strategy)
         )
         """)
@@ -98,18 +102,42 @@ def init_db():
                 (datetime.utcnow().isoformat(), START_BALANCE)
             )
 
+        defaults = {
+            "engine_status": "LEARNING",
+            "peak_balance": str(START_BALANCE),
+            "daily_date": str(date.today()),
+            "daily_pnl": "0"
+        }
+
+        for k, v in defaults.items():
+            con.execute(
+                "INSERT OR IGNORE INTO engine_state VALUES (?, ?)",
+                (k, v)
+            )
+
         for s in SYMBOL_MAP:
             for strat in STRATEGIES:
                 con.execute("""
                     INSERT OR IGNORE INTO strategy_state
-                    VALUES (?, ?, 1.0, 'ACTIVE', NULL)
+                    VALUES (?, ?, 1.0, 1.0, 1.0, 'ACTIVE')
                 """, (s, strat))
 
 init_db()
 
 # ==================================================
-# UTILS
+# STATE / BALANCE
 # ==================================================
+def get_state(key):
+    return db().execute(
+        "SELECT value FROM engine_state WHERE key=?", (key,)
+    ).fetchone()[0]
+
+def set_state(key, value):
+    db().execute(
+        "UPDATE engine_state SET value=? WHERE key=?",
+        (str(value), key)
+    ).connection.commit()
+
 def get_balance():
     return db().execute(
         "SELECT balance FROM balance ORDER BY time DESC LIMIT 1"
@@ -122,10 +150,9 @@ def update_balance(delta):
         (datetime.utcnow().isoformat(), bal)
     ).connection.commit()
 
-def calculate_lot(weight):
-    risk = get_balance() * BASE_RISK * weight
-    return round(max(risk / (SL_POINTS * POINT_VALUE), 0.01), 2)
-
+# ==================================================
+# PRICE
+# ==================================================
 def get_price(symbol):
     try:
         r = requests.get(
@@ -138,42 +165,62 @@ def get_price(symbol):
         return None
 
 # ==================================================
-# CONTEXT LOGIC (ETAP 29)
+# CONTEXT BLOCK
 # ==================================================
 def is_context_blocked(symbol, strategy):
     now = datetime.utcnow()
-    h = now.hour
-    wd = now.weekday()
-
     row = db().execute("""
         SELECT blocked_until FROM trade_context
         WHERE symbol=? AND strategy=? AND hour=? AND weekday=?
-    """, (symbol, strategy, h, wd)).fetchone()
+    """, (symbol, strategy, now.hour, now.weekday())).fetchone()
 
-    if not row or not row[0]:
-        return False
-
-    return datetime.fromisoformat(row[0]) > now
+    return row and row[0] and datetime.fromisoformat(row[0]) > now
 
 def penalize_context(symbol, strategy):
     now = datetime.utcnow()
-    h = now.hour
-    wd = now.weekday()
-    block_until = (now + timedelta(hours=6)).isoformat()
-
     db().execute("""
         INSERT OR REPLACE INTO trade_context
         VALUES (?, ?, ?, ?, ?)
-    """, (symbol, strategy, h, wd, block_until)).connection.commit()
+    """, (
+        symbol, strategy, now.hour, now.weekday(),
+        (now + timedelta(hours=6)).isoformat()
+    )).connection.commit()
 
-def losing_streak(symbol, strategy):
+# ==================================================
+# ADAPTIVE TP / SL — ETAP 30
+# ==================================================
+def adaptive_levels(symbol, strategy):
+    row = db().execute("""
+        SELECT tp_mult, sl_mult FROM strategy_state
+        WHERE symbol=? AND strategy=?
+    """, (symbol, strategy)).fetchone()
+
+    return (
+        BASE_TP * row[0],
+        BASE_SL * row[1]
+    )
+
+def update_adaptive(symbol, strategy):
     rows = db().execute("""
         SELECT pnl FROM trades
         WHERE symbol=? AND strategy=? AND status='CLOSED'
-        ORDER BY id DESC LIMIT 3
+        ORDER BY id DESC LIMIT 20
     """, (symbol, strategy)).fetchall()
 
-    return len(rows) == 3 and all(r[0] <= 0 for r in rows)
+    if len(rows) < 10:
+        return
+
+    pnls = [r[0] for r in rows]
+    winrate = len([p for p in pnls if p > 0]) / len(pnls)
+
+    tp_mult = 1.1 if winrate > 0.6 else 0.9
+    sl_mult = 0.9 if winrate < 0.45 else 1.0
+
+    db().execute("""
+        UPDATE strategy_state
+        SET tp_mult=?, sl_mult=?
+        WHERE symbol=? AND strategy=?
+    """, (tp_mult, sl_mult, symbol, strategy)).connection.commit()
 
 # ==================================================
 # TRADING
@@ -182,15 +229,8 @@ def open_trade(symbol, strategy, action, price):
     if is_context_blocked(symbol, strategy):
         return
 
-    state = db().execute("""
-        SELECT weight, status FROM strategy_state
-        WHERE symbol=? AND strategy=?
-    """, (symbol, strategy)).fetchone()
-
-    if not state or state[1] == "DISABLED":
-        return
-
-    lot = calculate_lot(state[0])
+    tp, sl = adaptive_levels(symbol, strategy)
+    lot = round((get_balance() * BASE_RISK) / (sl * POINT_VALUE), 2)
 
     db().execute("""
         INSERT INTO trades
@@ -211,8 +251,9 @@ def close_trade(trade_id, symbol, strategy, pnl, price):
     )).connection.commit()
 
     update_balance(pnl)
+    update_adaptive(symbol, strategy)
 
-    if pnl <= 0 and losing_streak(symbol, strategy):
+    if pnl <= 0:
         penalize_context(symbol, strategy)
 
 # ==================================================
@@ -228,8 +269,6 @@ async def webhook(request: Request):
     if not action:
         return {"status": "ignored"}
 
-    opened = []
-
     for symbol in SYMBOL_MAP:
         price = get_price(symbol)
         if price is None:
@@ -237,16 +276,16 @@ async def webhook(request: Request):
 
         for strat in STRATEGIES:
             open_trade(symbol, strat, action, price)
-            opened.append(f"{symbol}:{strat}")
 
-    return {"opened": opened}
+    return {"status": "accepted", "engine": get_state("engine_status")}
 
 # ==================================================
-# API
+# DASHBOARD
 # ==================================================
-@app.get("/stats")
-def stats():
+@app.get("/dashboard")
+def dashboard():
     return {
+        "engine": get_state("engine_status"),
         "balance": get_balance(),
         "blocked_contexts": db().execute(
             "SELECT * FROM trade_context WHERE blocked_until IS NOT NULL"
