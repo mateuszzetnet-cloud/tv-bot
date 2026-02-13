@@ -1,6 +1,5 @@
-print("VERSION 39 LIVE")
+print("VERSION 40 STABLE")
 
-import os
 import sqlite3
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
@@ -56,39 +55,25 @@ init_db()
 # 💰 BALANCE
 # ==================================================
 def get_balance():
-    return db().execute(
+    row = db().execute(
         "SELECT balance FROM balance ORDER BY time DESC LIMIT 1"
-    ).fetchone()[0]
+    ).fetchone()
+
+    return row[0] if row else START_BALANCE
 
 def update_balance(new_balance):
-    db().execute(
-        "INSERT INTO balance VALUES (?, ?)",
-        (datetime.utcnow().isoformat(), new_balance)
-    ).connection.commit()
+    with db() as con:
+        con.execute(
+            "INSERT INTO balance VALUES (?, ?)",
+            (datetime.utcnow().isoformat(), new_balance)
+        )
 
 # ==================================================
-# 📊 STRATEGY METRICS
-# ==================================================
-def strategy_metrics(strategy):
-    rows = db().execute("""
-        SELECT pnl FROM trades
-        WHERE strategy=? AND status='CLOSED'
-    """, (strategy,)).fetchall()
-
-    if not rows:
-        return 0, 0
-
-    pnls = [r[0] for r in rows]
-    wins = [p for p in pnls if p > 0]
-
-    winrate = round(len(wins) / len(pnls) * 100, 1)
-    return winrate, len(pnls)
-
-# ==================================================
-# 📥 OTWARCIE TRADE (z webhook)
+# 📥 OPEN TRADE (WEBHOOK)
 # ==================================================
 @app.post("/webhook")
 async def webhook(request: Request):
+
     text = (await request.body()).decode().lower()
 
     if "buy" in text:
@@ -101,61 +86,68 @@ async def webhook(request: Request):
     symbol = "XAUUSD"
     strategy = "MANUAL"
 
-    entry_price = float(text.split("price:")[1].strip()) if "price:" in text else 2000.0
+    entry_price = 2000.0
+    if "price:" in text:
+        try:
+            entry_price = float(text.split("price:")[1].strip())
+        except:
+            pass
+
     lot = 0.1
 
-    db().execute("""
-        INSERT INTO trades
-        (symbol, strategy, action, entry_price, close_price, lot, status, pnl, time_open)
-        VALUES (?, ?, ?, ?, NULL, ?, 'OPEN', 0, ?)
-    """, (
-        symbol,
-        strategy,
-        action,
-        entry_price,
-        lot,
-        datetime.utcnow().isoformat()
-    )).connection.commit()
+    with db() as con:
+        con.execute("""
+            INSERT INTO trades
+            (symbol, strategy, action, entry_price, close_price, lot, status, pnl, time_open)
+            VALUES (?, ?, ?, ?, NULL, ?, 'OPEN', 0, ?)
+        """, (
+            symbol,
+            strategy,
+            action,
+            entry_price,
+            lot,
+            datetime.utcnow().isoformat()
+        ))
 
     return {"status": "trade_opened"}
 
 # ==================================================
-# 🔒 RĘCZNE ZAMKNIĘCIE TRADE
+# 🔒 CLOSE TRADE
 # ==================================================
 @app.post("/close/{trade_id}")
 def close_trade(trade_id: int, close_price: float):
 
     trade = db().execute("""
-        SELECT action, entry_price, lot, strategy
+        SELECT action, entry_price, lot
         FROM trades
         WHERE id=? AND status='OPEN'
     """, (trade_id,)).fetchone()
 
     if not trade:
-        raise HTTPException(404, "Trade not found")
+        raise HTTPException(status_code=404, detail="Trade not found")
 
-    action, entry_price, lot, strategy = trade
+    action, entry_price, lot = trade
 
     if action == "buy":
         pnl = (close_price - entry_price) * lot
     else:
         pnl = (entry_price - close_price) * lot
 
-    db().execute("""
-        UPDATE trades
-        SET status='CLOSED',
-            close_price=?,
-            pnl=?,
-            time_close=?
-        WHERE id=?
-    """, (
-        close_price,
-        pnl,
-        datetime.utcnow().isoformat(),
-        trade_id
-    )).connection.commit()
+    with db() as con:
+        con.execute("""
+            UPDATE trades
+            SET status='CLOSED',
+                close_price=?,
+                pnl=?,
+                time_close=?
+            WHERE id=?
+        """, (
+            close_price,
+            pnl,
+            datetime.utcnow().isoformat(),
+            trade_id
+        ))
 
-    # aktualizacja balansu
     new_balance = get_balance() + pnl
     update_balance(new_balance)
 
@@ -213,12 +205,37 @@ def stats():
     }
 
 # ==================================================
-# 📋 LISTA TRADE
+# 📈 EQUITY
+# ==================================================
+@app.get("/equity")
+def equity():
+
+    rows = db().execute("""
+        SELECT time, balance FROM balance
+        ORDER BY time ASC
+    """).fetchall()
+
+    return [
+        {
+            "time": r[0],
+            "balance": r[1]
+        }
+        for r in rows
+    ]
+
+# ==================================================
+# 📋 ALL TRADES
 # ==================================================
 @app.get("/trades")
 def trades():
-    return db().execute("""
-        SELECT id, symbol, action, entry_price, close_price,
-               lot, status, pnl
-        FROM trades ORDER BY id DESC
+
+    rows = db().execute("""
+        SELECT id, symbol, strategy, action,
+               entry_price, close_price,
+               lot, status, pnl,
+               time_open, time_close
+        FROM trades
+        ORDER BY id DESC
     """).fetchall()
+
+    return rows
