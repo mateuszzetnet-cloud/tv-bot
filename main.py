@@ -1,39 +1,17 @@
+print("VERSION 39 LIVE")
+
 import os
 import sqlite3
-import requests
-import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 
 # ==================================================
 # 🔧 APP
 # ==================================================
 app = FastAPI()
-logging.basicConfig(level=logging.INFO)
-
-WEBHOOK_SECRET = os.getenv("WEBHOOK_TOKEN")
-TWELVE_API_KEY = os.getenv("TWELVE_API_KEY")
 
 DB_FILE = "trading.db"
-START_BALANCE = 1_000.0
-
-# ==================================================
-# ⚠️ RISK CONFIG (ETAP 35)
-# ==================================================
-BASE_RISK = 0.01
-MIN_RISK = 0.003
-MAX_RISK = 0.02
-
-MAX_DAILY_LOSS = 0.03
-MAX_DRAWDOWN = 0.10
-
-TP_POINTS = 20
-SL_POINTS = 10
-POINT_VALUE = 1.0
-
-SYMBOL_MAP = {
-    "XAUUSD": "XAU/USD",
-}
+START_BALANCE = 1000.0
 
 # ==================================================
 # 🗄️ DATABASE
@@ -47,9 +25,10 @@ def init_db():
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT,
+            strategy TEXT,
             action TEXT,
             entry_price REAL,
-            exit_price REAL,
+            close_price REAL,
             lot REAL,
             status TEXT,
             pnl REAL,
@@ -65,48 +44,13 @@ def init_db():
         )
         """)
 
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS engine_state (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-        """)
-
         if con.execute("SELECT COUNT(*) FROM balance").fetchone()[0] == 0:
             con.execute(
                 "INSERT INTO balance VALUES (?, ?)",
                 (datetime.utcnow().isoformat(), START_BALANCE)
             )
 
-        defaults = {
-            "engine_status": "LEARNING",
-            "peak_balance": str(START_BALANCE),
-            "daily_date": str(date.today()),
-            "daily_pnl": "0",
-            "current_risk": str(BASE_RISK)
-        }
-
-        for k, v in defaults.items():
-            con.execute(
-                "INSERT OR IGNORE INTO engine_state VALUES (?, ?)",
-                (k, v)
-            )
-
 init_db()
-
-# ==================================================
-# 📊 ENGINE STATE
-# ==================================================
-def get_state(key):
-    return db().execute(
-        "SELECT value FROM engine_state WHERE key=?", (key,)
-    ).fetchone()[0]
-
-def set_state(key, value):
-    db().execute(
-        "UPDATE engine_state SET value=? WHERE key=?",
-        (str(value), key)
-    ).connection.commit()
 
 # ==================================================
 # 💰 BALANCE
@@ -116,169 +60,165 @@ def get_balance():
         "SELECT balance FROM balance ORDER BY time DESC LIMIT 1"
     ).fetchone()[0]
 
-def update_balance(delta):
-    bal = get_balance() + delta
+def update_balance(new_balance):
     db().execute(
         "INSERT INTO balance VALUES (?, ?)",
-        (datetime.utcnow().isoformat(), bal)
+        (datetime.utcnow().isoformat(), new_balance)
     ).connection.commit()
 
-    peak = float(get_state("peak_balance"))
-    if bal > peak:
-        set_state("peak_balance", bal)
+# ==================================================
+# 📊 STRATEGY METRICS
+# ==================================================
+def strategy_metrics(strategy):
+    rows = db().execute("""
+        SELECT pnl FROM trades
+        WHERE strategy=? AND status='CLOSED'
+    """, (strategy,)).fetchall()
 
-def calculate_dynamic_risk():
-    """ETAP 35 — dynamiczne skalowanie ryzyka"""
-    cur = db().execute("""
-        SELECT pnl FROM trades WHERE status='CLOSED'
-        ORDER BY id DESC LIMIT 50
-    """).fetchall()
+    if not rows:
+        return 0, 0
 
-    if len(cur) < 20:
-        return BASE_RISK
-
-    pnls = [r[0] for r in cur]
+    pnls = [r[0] for r in rows]
     wins = [p for p in pnls if p > 0]
 
-    winrate = len(wins) / len(pnls)
-    expectancy = sum(pnls) / len(pnls)
-
-    balance = get_balance()
-    peak = float(get_state("peak_balance"))
-    dd = (peak - balance) / peak if peak > 0 else 0
-
-    risk = BASE_RISK
-
-    if winrate > 0.58 and expectancy > 0:
-        risk += 0.002
-
-    if winrate > 0.62:
-        risk += 0.002
-
-    if dd > 0.05:
-        risk -= 0.003
-
-    risk = max(MIN_RISK, min(MAX_RISK, risk))
-    set_state("current_risk", risk)
-    return risk
-
-def calculate_lot():
-    bal = get_balance()
-    risk = calculate_dynamic_risk()
-    risk_amount = bal * risk
-    lot = risk_amount / (SL_POINTS * POINT_VALUE)
-    return round(max(lot, 0.01), 2)
+    winrate = round(len(wins) / len(pnls) * 100, 1)
+    return winrate, len(pnls)
 
 # ==================================================
-# 🔎 PARSER
+# 📥 OTWARCIE TRADE (z webhook)
 # ==================================================
-def parse_signal(text: str):
-    t = text.lower()
-    action = "buy" if "buy" in t else "sell" if "sell" in t else None
-    if not action:
-        return None
+@app.post("/webhook")
+async def webhook(request: Request):
+    text = (await request.body()).decode().lower()
 
-    symbol = "XAUUSD" if "xauusd" in t else None
-    if symbol not in SYMBOL_MAP:
-        return None
+    if "buy" in text:
+        action = "buy"
+    elif "sell" in text:
+        action = "sell"
+    else:
+        return {"status": "ignored"}
 
-    return {
-        "symbol": symbol,
-        "action": action,
-        "raw": text.strip()
-    }
+    symbol = "XAUUSD"
+    strategy = "MANUAL"
 
-# ==================================================
-# 📈 MARKET DATA
-# ==================================================
-def get_price(symbol):
-    try:
-        r = requests.get(
-            "https://api.twelvedata.com/price",
-            params={"symbol": SYMBOL_MAP[symbol], "apikey": TWELVE_API_KEY},
-            timeout=5
-        ).json()
-        return float(r["price"])
-    except Exception:
-        return None
+    entry_price = float(text.split("price:")[1].strip()) if "price:" in text else 2000.0
+    lot = 0.1
 
-# ==================================================
-# 📄 PAPER ENGINE
-# ==================================================
-def open_trade(parsed, price):
-    lot = calculate_lot()
     db().execute("""
         INSERT INTO trades
-        (symbol, action, entry_price, lot, status, pnl, time_open)
-        VALUES (?, ?, ?, ?, 'OPEN', 0, ?)
+        (symbol, strategy, action, entry_price, close_price, lot, status, pnl, time_open)
+        VALUES (?, ?, ?, ?, NULL, ?, 'OPEN', 0, ?)
     """, (
-        parsed["symbol"],
-        parsed["action"],
-        price,
+        symbol,
+        strategy,
+        action,
+        entry_price,
         lot,
         datetime.utcnow().isoformat()
     )).connection.commit()
 
-def close_trade(trade_id, pnl, price):
+    return {"status": "trade_opened"}
+
+# ==================================================
+# 🔒 RĘCZNE ZAMKNIĘCIE TRADE
+# ==================================================
+@app.post("/close/{trade_id}")
+def close_trade(trade_id: int, close_price: float):
+
+    trade = db().execute("""
+        SELECT action, entry_price, lot, strategy
+        FROM trades
+        WHERE id=? AND status='OPEN'
+    """, (trade_id,)).fetchone()
+
+    if not trade:
+        raise HTTPException(404, "Trade not found")
+
+    action, entry_price, lot, strategy = trade
+
+    if action == "buy":
+        pnl = (close_price - entry_price) * lot
+    else:
+        pnl = (entry_price - close_price) * lot
+
     db().execute("""
         UPDATE trades
         SET status='CLOSED',
-            exit_price=?,
+            close_price=?,
             pnl=?,
             time_close=?
         WHERE id=?
     """, (
-        price,
+        close_price,
         pnl,
         datetime.utcnow().isoformat(),
         trade_id
     )).connection.commit()
 
-    update_balance(pnl)
-
-# ==================================================
-# 🌐 WEBHOOK
-# ==================================================
-@app.post("/webhook")
-async def webhook(request: Request):
-    if request.query_params.get("token") != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403)
-
-    body = (await request.body()).decode()
-    parsed = parse_signal(body)
-    if not parsed:
-        return {"status": "ignored"}
-
-    price = get_price(parsed["symbol"])
-    if price is None:
-        return {"status": "no_price"}
-
-    open_trade(parsed, price)
+    # aktualizacja balansu
+    new_balance = get_balance() + pnl
+    update_balance(new_balance)
 
     return {
-        "status": "paper_trade",
-        "engine": get_state("engine_status"),
-        "risk": float(get_state("current_risk"))
+        "closed_trade": trade_id,
+        "pnl": round(pnl, 2),
+        "new_balance": round(new_balance, 2)
     }
 
 # ==================================================
-# 📊 STATS / DASHBOARD
+# 📊 DASHBOARD
+# ==================================================
+@app.get("/dashboard")
+def dashboard():
+
+    open_trades = db().execute("""
+        SELECT id, symbol, strategy, action, entry_price, lot
+        FROM trades
+        WHERE status='OPEN'
+    """).fetchall()
+
+    closed = db().execute("""
+        SELECT pnl FROM trades WHERE status='CLOSED'
+    """).fetchall()
+
+    total_pnl = sum(r[0] for r in closed) if closed else 0
+
+    return {
+        "balance": get_balance(),
+        "open_trades": open_trades,
+        "closed_trades": len(closed),
+        "total_pnl": round(total_pnl, 2)
+    }
+
+# ==================================================
+# 📊 STATS
 # ==================================================
 @app.get("/stats")
 def stats():
+
+    closed = db().execute("""
+        SELECT pnl FROM trades WHERE status='CLOSED'
+    """).fetchall()
+
+    wins = [r for r in closed if r[0] > 0]
+
+    winrate = 0
+    if closed:
+        winrate = round(len(wins) / len(closed) * 100, 1)
+
     return {
-        "engine_status": get_state("engine_status"),
         "balance": get_balance(),
-        "risk": float(get_state("current_risk")),
-        "peak_balance": float(get_state("peak_balance"))
+        "total_trades": len(closed),
+        "winrate": winrate
     }
 
+# ==================================================
+# 📋 LISTA TRADE
+# ==================================================
 @app.get("/trades")
-def trades(limit: int = 50):
-    cur = db().execute("""
-        SELECT symbol, action, entry_price, exit_price, pnl, status, time_open
-        FROM trades
-        ORDER BY id DESC
-        LIMIT ?
-    """, (limit,))
-    return cur.fetchall()
+def trades():
+    return db().execute("""
+        SELECT id, symbol, action, entry_price, close_price,
+               lot, status, pnl
+        FROM trades ORDER BY id DESC
+    """).fetchall()
